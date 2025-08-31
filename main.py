@@ -769,6 +769,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for i in range(count):
             try:
                 result = perform_buy(wallet, private_key, token_out, amount)
+                time.sleep(10)
                 if result != -1:
                     success_count += 1
                     await msg.edit_text(f"✅ Swapped ETH {i+1} times")
@@ -778,7 +779,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await msg.edit_text(f"⚠️ Swap {i+1} failed: {str(e)}")
                 return
 
-            await asyncio.sleep(10)  # delay between swaps
+              # delay between swaps
 
         await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
         time.sleep(3)
