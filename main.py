@@ -776,6 +776,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await msg.edit_text(f"⚠️ Swap {i+1} failed")
             except Exception as e:
                 await msg.edit_text(f"⚠️ Swap {i+1} failed: {str(e)}")
+                return
 
             await asyncio.sleep(1)  # delay between swaps
 
