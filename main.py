@@ -9,7 +9,6 @@ from web3 import Web3
 from io import BytesIO
 from eth_account import Account
 from swapcode import Uniswap
-from keep_alive import run_server
 
 load_dotenv(override=True)
 
@@ -881,8 +880,6 @@ def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(TOKEN).build()
 
-    run_server(10000)  # port must match Render port
-
     app.add_handler(CommandHandler("start", start_handler))
 
     # keep your existing handlers for /buy, /sell, /txnbot and their confirm/cancel callbacks
@@ -915,7 +912,6 @@ def main():
     # Register commands to Telegram menu when bot starts
     app.post_init.append(set_commands)
 
-    app.idle()
 
 
 if __name__ == "__main__":
