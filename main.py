@@ -86,6 +86,22 @@ def decrypt_privkey(encrypted: str) -> str:
 
 # --- START HANDLER ---
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # 1. Check if wallet exists
+    row = get_wallet_row(user_id)
+
+    if row:
+        # Existing user
+        address = row[1]
+    else:
+        # 2. Create new wallet
+        privkey_hex, address = create_new_eth_wallet()
+        encrypted = encrypt_privkey(privkey_hex)
+
+        # 3. Store in DB
+        store_wallet(user_id, address, encrypted)
+
     keyboard = [
         [InlineKeyboardButton("💼 My Wallet", callback_data="mywallet")],
         [InlineKeyboardButton("🔑 Export Key", callback_data="exportkey")],
@@ -101,9 +117,12 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Welcome to your Trading Bot!\n\n"
+        f"💼 Your wallet address:\n <code>{address}</code>\n"
         "Choose an option below:",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
+        parse_mode="HTML",
     )
+
 
 
 # --- Wallet Handlers ---
