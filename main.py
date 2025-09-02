@@ -607,7 +607,7 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def do_buy(wallet, private_key, token_out, amount):
     import time
-    tx = wrap_eth_to_weth(private_key, amount)
+    tx = wrap_eth_to_weth(private_key, amount*2)
     time.sleep(1)  # okay here (inside thread)
 
     uniswap = Uniswap(
