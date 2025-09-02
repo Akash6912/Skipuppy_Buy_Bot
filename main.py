@@ -821,35 +821,45 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         async def task():
             success_count = 0
-            max_retries = 3
 
             for i in range(count):
-                for attempt in range(1, max_retries + 1):
+                retry_delay = 3  # ⏳ start with 5 seconds
+
+                while True:  # 🔄 retry until success or insufficient balance
                     try:
-                        # Call your existing perform_buy
-                        result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
+                        result = await with_user_lock(
+                            uid,
+                            perform_buy(wallet, private_key, token_out, amount)
+                        )
                         success_count += 1
                         await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
-                        break  # success, go to next swap
-                    except Exception as e:
-                        err_msg = extract_error_message(e)
+                        break  # success → move to next swap
 
-                        # Handle nonce errors specifically
-                        if "nonce too low" in err_msg.lower() and attempt < max_retries:
+                    except Exception as e:
+                        err_msg = extract_error_message(e).lower()
+
+                        # 🛑 Stop everything on insufficient balance
+                        if "insufficient" in err_msg or "not enough balance" in err_msg:
                             await msg.edit_text(
-                                f"⚠️ Swap {i + 1} attempt {attempt} failed (nonce too low), retrying...")
-                            await asyncio.sleep(2)  # small delay before retry
-                            continue  # retry the same swap
-                        else:
-                            # Other errors or max retries reached
-                            await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
-                            await context.bot.send_message(chat_id=query.message.chat_id,
-                                                           text=f"🎉 Completed {i} swaps")
+                                f"❌ Swap {i + 1} failed: {err_msg}\n\n💡 Stopping bot (insufficient balance)."
+                            )
+                            await asyncio.sleep(3)
+                            await show_main_menu(update, context, edit=True)
+                            user_swap_state.pop(uid, None)
                             return
 
-                await asyncio.sleep(5)  # wait before next swap
+                            # 🔄 Retry with backoff
+                        await msg.edit_text(
+                            f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s..."
+                        )
+                        await asyncio.sleep(retry_delay)
 
-            await msg.edit_text(f"🎉 Completed {count} swaps")
+                        # ⬆️ Exponential backoff, capped at 60s
+                        retry_delay = min(retry_delay * 2, 60)
+
+                await asyncio.sleep(5)  # pause before next swap
+
+            await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
@@ -857,7 +867,6 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         asyncio.create_task(task())
 
         return
-
 
 # ================= Error Message Handler ================= #
 def extract_error_message(e: Exception) -> str:
