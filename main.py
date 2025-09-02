@@ -856,6 +856,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
 
+# ================= Error Message Handler ================= #
 def extract_error_message(e: Exception) -> str:
     """Extract a clean error message from an exception, handling dicts and stringified dicts."""
     err_msg = str(e)  # default fallback
