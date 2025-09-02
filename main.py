@@ -843,7 +843,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             # Other errors or max retries reached
                             await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
                             await context.bot.send_message(chat_id=query.message.chat_id,
-                                                           text=f"🎉 Completed {count} swaps")
+                                                           text=f"🎉 Completed {i} swaps")
                             return
 
                 await asyncio.sleep(5)  # wait before next swap
