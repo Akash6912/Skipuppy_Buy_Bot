@@ -7,6 +7,7 @@ import qrcode
 import requests
 import sqlite3
 import warnings
+import ast
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from cryptography.fernet import Fernet
@@ -404,7 +405,8 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ ETH withdrawal sent!\n🔗 {txn_link}")
 
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error while sending: {e}")
+        err_msg = extract_error_message(e)
+        await update.message.reply_text(f"⚠️ Error while sending: {err_msg}")
 
     await asyncio.sleep(3)  # ✅ non-blocking sleep
     await show_main_menu(update, context, edit=True)
@@ -731,9 +733,10 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
 
             except Exception as e:
+                err_msg = extract_error_message(e)
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text=f"⚠️ Sell failed.\nError: {str(e)}"
+                    text=f"⚠️ Sell failed.\nError: {err_msg}"
                 )
             finally:
                 await asyncio.sleep(3)  # non-blocking wait
@@ -771,7 +774,8 @@ def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
         return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
 
     except Exception as e:
-        print(f"Sell failed: {e}")
+        err_msg = extract_error_message(e)
+        print(f"Sell failed: {err_msg}")
         return -1
 
 
@@ -817,7 +821,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
                 await context.bot.send_message(chat_id=query.message.chat_id, text=result)
             except Exception as e:
-                await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {e}")
+                err_msg = extract_error_message(e)
+                await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {err_msg}")
             finally:
                 await asyncio.sleep(3)
                 await show_main_menu(update, context, edit=True)
@@ -844,7 +849,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     success_count += 1
                     await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
                 except Exception as e:
-                    await msg.edit_text(f"⚠️ Swap {i + 1} failed: {e}")
+                    err_msg = extract_error_message(e)
+                    await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
                     return
                 await asyncio.sleep(5)  # non-blocking delay
             if success_count == (count+1):
@@ -855,6 +861,28 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         asyncio.create_task(task())  # 🚀 background task
         return
+
+
+import ast
+
+
+def extract_error_message(e: Exception) -> str:
+    """Extract a clean error message from an exception, handling dicts and stringified dicts."""
+    err_msg = str(e)  # default fallback
+
+    if hasattr(e, "args") and e.args:
+        first = e.args[0]
+        if isinstance(first, dict):
+            err_msg = first.get("message", str(e))
+        elif isinstance(first, str):
+            try:
+                parsed = ast.literal_eval(first)
+                if isinstance(parsed, dict) and "message" in parsed:
+                    err_msg = parsed["message"]
+            except Exception:
+                pass  # fallback to str(e)
+
+    return err_msg
 
 
 # ================= Show Menu Handlers ================= #
