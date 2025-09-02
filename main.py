@@ -1,14 +1,28 @@
-from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, \
+import aiohttp
+import asyncio
+import json
+import logging
+import os
+import qrcode
+import requests
+import sqlite3
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from eth_account import Account
+from telegram import Update, InputFile, ReplyKeyboardRemove, InlineKeyboardMarkup, \
     InlineKeyboardButton, BotCommand
 from telegram.ext import Application, ConversationHandler, CommandHandler, MessageHandler, CallbackQueryHandler, \
     filters, ContextTypes
-import os, time, requests, qrcode, json, logging, aiohttp, asyncio, sqlite3
-from cryptography.fernet import Fernet
-from dotenv import load_dotenv
+from telegram.warnings import PTBUserWarning
 from web3 import Web3
-from io import BytesIO
-from eth_account import Account
+
 from swapcode import Uniswap
+
+# Suppress only PTBUserWarning (not all warnings)
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 load_dotenv(override=True)
 
@@ -20,6 +34,9 @@ logger = logging.getLogger(__name__)
 # --- Web3 Setup (Base Chain) ---
 BASE_RPC = os.getenv("BASE_RPC", os.environ.get("BASE_RPC"))
 w3 = Web3(Web3.HTTPProvider(BASE_RPC))
+
+# Reuse a thread pool for blocking web3 calls
+executor = ThreadPoolExecutor(max_workers=30)
 
 
 # --- DB setup ---
@@ -84,7 +101,7 @@ def decrypt_privkey(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
 
 
-# --- START HANDLER ---
+# ================= Start Handler ================= #
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -118,14 +135,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to your Trading Bot!\n\n"
         f"💼 Your wallet address:\n <code>{address}</code>\n"
-        "Choose an option below:",
+        "\nChoose an option below:",
         reply_markup=reply_markup,
         parse_mode="HTML",
     )
 
 
-
-# --- Wallet Handlers ---
+# ================= Wallet Handler ================= #
 async def mywallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     row = get_wallet_row(tid)
@@ -140,11 +156,11 @@ async def mywallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"💼 Your wallet address:\n <code>{address}</code>\n",
         parse_mode="HTML",
     )
-    time.sleep(3)
+    await asyncio.sleep(2)
     await show_main_menu(update, context, edit=True)
 
 
-# --- ExportKey Handlers ---
+# ================= ExportKey Handler ================= #
 async def exportkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     row = get_wallet_row(tid)
@@ -169,11 +185,11 @@ async def exportkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         parse_mode="HTML",
     )
-    time.sleep(3)
+    await asyncio.sleep(2)
     await show_main_menu(update, context, edit=True)
 
 
-# --- Balance Handlers ---
+# ================= Balance Handler ================= #
 async def fetch_metadata(session, contract_address):
     """Fetch token metadata from Alchemy for a given contract."""
     meta_payload = {
@@ -257,11 +273,11 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"• {symbol} ({name}): {human:.6f}\n"
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
-    time.sleep(3)
+    await asyncio.sleep(2)
     await show_main_menu(update, context, edit=True)
 
 
-# --- Help Handlers ---
+# ================= Help Handler ================= #
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -279,11 +295,11 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Security reminder: do not share your private key with strangers. Keep the MASTER_KEY safe on the server."
         ),
     )
-    time.sleep(3)
+    await asyncio.sleep(2)
     await show_main_menu(update, context, edit=True)
 
 
-# --- Deposit Handlers ---
+# ================= Deposit Handlers ================= #
 async def deposit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     row = get_wallet_row(tid)
@@ -313,11 +329,13 @@ async def deposit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=msg,
         parse_mode="HTML"
     )
-    time.sleep(3)
+    await asyncio.sleep(2)
     await show_main_menu(update, context, edit=True)
 
-# --- Withdrawl Handlers ---
+
+# ================= Withdrawal Handlers ================= #
 WITHDRAW_ADDRESS, WITHDRAW_AMOUNT = range(2)
+
 
 # Step 0: Start withdraw (button or command)
 async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,7 +367,7 @@ async def withdraw_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Step 2: Save amount & execute withdrawal
 async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
-    row = get_wallet_row(tid)  # must return (tid, wallet_address, encrypted_privkey)
+    row = get_wallet_row(tid)  # (tid, wallet_address, encrypted_privkey)
     BOT_ADDRESS = row[1]
 
     try:
@@ -360,8 +378,8 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     recipient = context.user_data["address"]
 
-    try:
-        # Convert ETH to wei
+    def send_withdrawal():
+        """Run blocking web3 code in threadpool."""
         value = w3.to_wei(amount, "ether")
         nonce = w3.eth.get_transaction_count(BOT_ADDRESS)
 
@@ -371,11 +389,16 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "gas": 21000,
             "gasPrice": w3.eth.gas_price,
             "nonce": nonce,
-            "chainId": 8453   # Base mainnet
+            "chainId": 8453  # Base mainnet
         }
 
         signed_tx = w3.eth.account.sign_transaction(tx, decrypt_privkey(row[2]))
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        tx_final = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        return tx_final
+
+    try:
+        loop = asyncio.get_running_loop()
+        tx_hash = await loop.run_in_executor(executor, send_withdrawal)
 
         txn_link = f"https://basescan.org/tx/{w3.to_hex(tx_hash)}"
         await update.message.reply_text(f"✅ ETH withdrawal sent!\n🔗 {txn_link}")
@@ -383,15 +406,14 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error while sending: {e}")
 
-    time.sleep(3)
+    await asyncio.sleep(3)  # ✅ non-blocking sleep
     await show_main_menu(update, context, edit=True)
     return ConversationHandler.END
 
 
-# Step 3: Cancel
 async def withdraw_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Withdrawal cancelled.", reply_markup=ReplyKeyboardRemove())
-    time.sleep(3)
+    await asyncio.sleep(3)  # ✅ non-blocking
     await show_main_menu(update, context, edit=True)
     return ConversationHandler.END
 
@@ -407,15 +429,11 @@ withdraw_handler = ConversationHandler(
         WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
     },
     fallbacks=[CommandHandler("cancel", withdraw_cancel)],
+    per_user=True,
+    per_chat=True
 )
 
-
-
-# --- Wrap/Unwrap eth Handlers ---
-user_swap_state = {}
-
-
-# WETH contract on Base
+# ================= Wrap/Unwrap eth Handlers ================= #
 WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
 WETH_ABI = [
     {
@@ -435,7 +453,6 @@ WETH_ABI = [
         "type": "function"
     }
 ]
-
 
 weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
 
@@ -482,6 +499,10 @@ def unwrap_weth_to_eth(private_key: str, amount_eth: float):
 
 
 # --- Buy Handlers ---
+user_swap_state = {}
+user_locks = {}
+
+
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address:")
     user_swap_state[update.effective_user.id] = {"step": "token_out", "mode": "buy"}
@@ -582,36 +603,45 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("⚠️ Invalid number. Enter an integer.")
 
 
-def perform_buy(wallet, private_key, token_out, amount, slippage=0.05):
+def do_buy(wallet, private_key, token_out, amount):
+    import time
     tx = wrap_eth_to_weth(private_key, amount)
-    time.sleep(1)
-    # 3. Instantiate the Uniswap helper
+    time.sleep(1)  # okay here (inside thread)
+
     uniswap = Uniswap(
         wallet_address=wallet,
         private_key=private_key,
-        provider=os.environ.get("BASE_RPC"),  # Used to auto-detect chain
+        provider=os.environ.get("BASE_RPC"),
         web3=w3
     )
 
-    # 4. Perform a swap (SWAP_EXACT_IN)
-    # Example: Swap 1 tokenIn -> tokenOut at 0.3% fee in a v3 pool
-    try:
-        value = w3.to_wei(amount, "ether")
-        tx_hash = uniswap.make_trade(
-            from_token="0x4200000000000000000000000000000000000006",
-            to_token=token_out,
-            amount=value,
-            fee=10000,  # e.g., 3000 for a 0.3% Uniswap V3 pool
-            slippage=2,  # non-functional right now. 0.5% slippage tolerance
-            pool_version="v3"  # can be "v3" or "v4"
-        )
-        print(f"Swap transaction sent! Tx hash: {tx_hash.hex()}")
-        return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
-    except Exception as e:
-        return
+    value = w3.to_wei(amount, "ether")
+    tx_hash = uniswap.make_trade(
+        from_token="0x4200000000000000000000000000000000000006",
+        to_token=token_out,
+        amount=value,
+        fee=10000,
+        slippage=2,
+        pool_version="v3"
+    )
+    return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
 
 
-# --- Sell Handlers ---
+async def with_user_lock(uid, coro):
+    """Ensure one user's swaps run sequentially, but allow concurrency across users."""
+    if uid not in user_locks:
+        user_locks[uid] = asyncio.Lock()
+    async with user_locks[uid]:
+        return await coro
+
+
+# --- PERFORM BUY --- #
+async def perform_buy(wallet, private_key, token_out, amount):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, do_buy, wallet, private_key, token_out, amount)
+
+
+# ================= Sell Handler ================= #
 def get_eth_balance(address):
     headers = {
         "Accept": "application/json",
@@ -652,11 +682,13 @@ def get_eth_balance(address):
         print("Error:", response.status_code, response.text)
 
 
+# --- SELL COMMAND ---
 async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address to sell:")
     user_swap_state[update.effective_user.id] = {"step": "token_in", "mode": "sell"}
 
 
+# --- SELL BUTTON HANDLER ---
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -672,6 +704,7 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.data == "cancel_sell":
         await query.edit_message_text("❌ Sell cancelled.")
         user_swap_state.pop(uid, None)
+        return
 
     elif query.data == "confirm_sell":
         wallet = row[1]
@@ -682,26 +715,36 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         await query.edit_message_text("⏳ Selling token...")
 
-        try:
-            result = perform_sell(wallet, private_key, token_in, amount)
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=result
-            )
-            if result == -1:
-                raise ValueError("Sell returned no result.")
-        except Exception as e:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"⚠️ Sell failed.\nError: {str(e)}"
-            )
-        time.sleep(3)
-        await show_main_menu(update, context, edit=True)
-        user_swap_state.pop(uid, None)
+        async def run_sell():
+            try:
+                # Run blocking Web3 code in background thread
+                result = await asyncio.to_thread(
+                    perform_sell, wallet, private_key, token_in, amount
+                )
+
+                if result == -1:
+                    raise ValueError("Sell returned no result.")
+
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=result
+                )
+
+            except Exception as e:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"⚠️ Sell failed.\nError: {str(e)}"
+                )
+            finally:
+                await asyncio.sleep(3)  # non-blocking wait
+                await show_main_menu(update, context, edit=True)
+                user_swap_state.pop(uid, None)
+
+        # Run sell without blocking bot
+        asyncio.create_task(run_sell())
 
 
 def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
-    # Instantiate Uniswap helper
     uniswap = Uniswap(
         wallet_address=wallet,
         private_key=private_key,
@@ -710,20 +753,23 @@ def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
     )
 
     try:
-        value = w3.to_wei(amount, "ether")  # assumes 18 decimals, adjust for tokens like USDC (6 decimals)
+        value = w3.to_wei(amount, "ether")  # assumes 18 decimals
         tx_hash = uniswap.make_trade(
             from_token=token_in,
             to_token="0x4200000000000000000000000000000000000006",  # WETH
             amount=value,
-            fee=10000,   # 1% pool, adjust to 3000 (0.3%) or 500 (0.05%) depending on liquidity
+            fee=10000,
             slippage=2,
             pool_version="v3"
         )
         print(f"Sell transaction sent! Tx hash: {tx_hash.hex()}")
-        time.sleep(1)
+
+        # (don’t block, leave confirmation to backend / explorer)
         if get_eth_balance(wallet) > 0:
             unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
-            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+
+        return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+
     except Exception as e:
         print(f"Sell failed: {e}")
         return -1
@@ -736,6 +782,7 @@ async def txnbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_swap_state[update.effective_user.id] = {"step": "token_out", "mode": "txnbot"}
 
 
+# --- BUTTON HANDLER (Single Buy / Multiple Buy) --- #
 async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -748,6 +795,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     state = user_swap_state[uid]
 
+    # Handle cancel
     if query.data.startswith("cancel_"):
         await query.edit_message_text("❌ Cancelled.")
         user_swap_state.pop(uid, None)
@@ -762,17 +810,22 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         amount = state["amount"]
 
         await query.edit_message_text("⏳ Swapping ETH...")
-        try:
-            result = perform_buy(wallet, private_key, token_out, amount)
-            if result == -1:
-                raise ValueError("Swap failed")
-            await context.bot.send_message(chat_id=query.message.chat_id, text=result)
-        except Exception as e:
-            await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {str(e)}")
 
-        time.sleep(3)
-        await show_main_menu(update, context, edit=True)
-        user_swap_state.pop(uid, None)
+        async def task():
+            try:
+                # Lock ensures no overlapping swaps for SAME user
+                result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
+                await context.bot.send_message(chat_id=query.message.chat_id, text=result)
+            except Exception as e:
+                await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {e}")
+            finally:
+                await asyncio.sleep(3)
+                await show_main_menu(update, context, edit=True)
+                user_swap_state.pop(uid, None)
+
+        # 🚀 Run in background (don’t await!)
+        asyncio.create_task(task())
+        return
 
     # ---------------- MULTIPLE SWAPS ---------------- #
     elif query.data == "confirm_txnbot" and state.get("mode") == "txnbot":
@@ -781,31 +834,29 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         count = state["count"]
 
         await query.edit_message_text(f"⏳ Starting {count} swaps...")
-
         msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
 
-        success_count = 0
-        for i in range(count):
-            try:
-                result = perform_buy(wallet, private_key, token_out, amount)
-                time.sleep(10)
-                if result != -1:
+        async def task():
+            success_count = 0
+            for i in range(count):
+                try:
+                    result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
                     success_count += 1
-                    await msg.edit_text(f"✅ Swapped ETH {i+1} times")
-                else:
-                    await msg.edit_text(f"⚠️ Swap {i+1} failed")
-            except Exception as e:
-                await msg.edit_text(f"⚠️ Swap {i+1} failed: {str(e)}")
-                return
+                    await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
+                except Exception as e:
+                    await msg.edit_text(f"⚠️ Swap {i + 1} failed: {e}")
+                await asyncio.sleep(5)  # non-blocking delay
 
-              # delay between swaps
+            await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
+            await asyncio.sleep(3)
+            await show_main_menu(update, context, edit=True)
+            user_swap_state.pop(uid, None)
 
-        await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
-        time.sleep(3)
-        await show_main_menu(update, context, edit=True)
-        user_swap_state.pop(uid, None)
+        asyncio.create_task(task())  # 🚀 background task
+        return
 
 
+# ================= Show Menu Handlers ================= #
 async def show_main_menu(update, context, edit=False):
     keyboard = [
         [InlineKeyboardButton("👛 My Wallet", callback_data="mywallet"),
@@ -838,8 +889,6 @@ async def show_main_menu(update, context, edit=False):
     context.user_data["menu_msg_id"] = msg.message_id
 
 
-
-# --- BUTTON HANDLER (redirects inline button clicks to commands) ---
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -877,8 +926,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await help_handler(update, context)
 
 
-
-
+# ================= SetCommands Handlers ================= #
 async def set_commands(app):
     await app.bot.set_my_commands([
         BotCommand("start", "Start the bot & show menu"),
@@ -894,10 +942,10 @@ async def set_commands(app):
     ])
 
 
-# --- Main ---
+# ================= Main ================= #
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(set_commands).build()
 
     app.add_handler(CommandHandler("start", start_handler))
 
@@ -923,14 +971,8 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_button_handler,
                                          pattern="^(mywallet|exportkey|balance|deposit|buy|sell|txnbot|help)$"))
 
-
-
     logger.info("Bot started. Press Ctrl+C to stop.")
     app.run_polling()
-
-    # Register commands to Telegram menu when bot starts
-    app.post_init.append(set_commands)
-
 
 
 if __name__ == "__main__":
