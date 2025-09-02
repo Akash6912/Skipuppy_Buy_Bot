@@ -383,7 +383,7 @@ class Uniswap:
             print(f"New Priority Fee: {Web3.from_wei(new_max_priority_fee, 'gwei')} gwei")
 
             signed_tx = self.w3.eth.account.sign_transaction(cancel_tx, self.account.key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             print(f"Cancellation transaction hash: {tx_hash.hex()}")
 
         except Exception as e:
