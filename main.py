@@ -689,6 +689,7 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address to sell:")
     user_swap_state[update.effective_user.id] = {"step": "token_in", "mode": "sell"}
 
+
 async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
     from swapcode import Uniswap
     import os
@@ -709,7 +710,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
                 to_token="0x4200000000000000000000000000000000000006",  # WETH
                 amount=value,
                 fee=10000,
-                slippage=int(slippage*100),
+                slippage=int(slippage * 100),
                 pool_version="v3",
             )
 
@@ -722,6 +723,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
 
     # Run blocking sell in thread, async safe
     return await asyncio.to_thread(sync_sell)
+
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -821,27 +823,40 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         async def task():
             success_count = 0
+            max_retries = 3
+
             for i in range(count):
-                try:
-                    result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
-                    success_count += 1
-                    await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
-                except Exception as e:
-                    err_msg = extract_error_message(e)
-                    await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
-                    return
-                await asyncio.sleep(5)  # non-blocking delay
-            if success_count == (count+1):
-                await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        # Call your existing perform_buy
+                        result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
+                        success_count += 1
+                        await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
+                        break  # success, go to next swap
+                    except Exception as e:
+                        err_msg = extract_error_message(e)
+
+                        # Handle nonce errors specifically
+                        if "nonce too low" in err_msg.lower() and attempt < max_retries:
+                            await msg.edit_text(
+                                f"⚠️ Swap {i + 1} attempt {attempt} failed (nonce too low), retrying...")
+                            await asyncio.sleep(2)  # small delay before retry
+                            continue  # retry the same swap
+                        else:
+                            # Other errors or max retries reached
+                            await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
+                            break
+
+                await asyncio.sleep(5)  # wait before next swap
+
+            await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
 
-        asyncio.create_task(task())  # 🚀 background task
+        asyncio.create_task(task())
+
         return
-
-
-import ast
 
 
 def extract_error_message(e: Exception) -> str:
