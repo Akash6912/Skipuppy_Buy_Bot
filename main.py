@@ -702,7 +702,6 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
         )
 
         value = w3.to_wei(amount, "ether")  # adjust decimals if needed
-        nonce = get_next_nonce(w3, wallet)
 
         try:
             tx_hash = uniswap.make_trade(
@@ -712,19 +711,17 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
                 fee=10000,
                 slippage=int(slippage*100),
                 pool_version="v3",
-                nonce=nonce
             )
 
             if get_eth_balance(wallet) > 0:
                 unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
 
-            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/{tx_hash.hex()}"
         except Exception as e:
             return f"⚠️ Sell failed: {str(e)}"
 
     # Run blocking sell in thread, async safe
     return await asyncio.to_thread(sync_sell)
-
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
