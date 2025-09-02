@@ -4,10 +4,6 @@ from eth_account import Account
 from uniswap_universal_router_decoder import FunctionRecipient, RouterCodec
 import time
 
-from threading import Lock
-
-
-
 # 🚀 Uniswap V4 Universal Router Addresses for Each Chain
 ROUTER_ADDRESSES = {
     "ethereum": "0x66a9893cc07d91d95644aedd05d03f95e1dba8af",
@@ -30,20 +26,6 @@ ERC20_ABI_JSON = "[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"_l2Brid
 UNIVERSAL_ROUTER_ABI = json.loads(UNIVERSAL_ROUTER_ABI_JSON)
 PERMIT2_ABI = json.loads(PERMIT2_ABI_JSON)
 ERC20_ABI = json.loads(ERC20_ABI_JSON)
-
-
-class NonceManager:
-    _lock = Lock()
-    _wallet_nonces = {}  # wallet_address -> next nonce
-
-    @classmethod
-    def get_next_nonce(cls, w3, wallet_address):
-        with cls._lock:
-            if wallet_address not in cls._wallet_nonces:
-                cls._wallet_nonces[wallet_address] = w3.eth.get_transaction_count(wallet_address, 'pending')
-            nonce = cls._wallet_nonces[wallet_address]
-            cls._wallet_nonces[wallet_address] += 1
-            return nonce
 
 
 class Uniswap:
@@ -128,7 +110,7 @@ class Uniswap:
             "type": 2,
             "chainId": self.w3.eth.chain_id,
             "value": 0,
-            "nonce": NonceManager.get_next_nonce(self.w3, self.address),
+            "nonce": self.w3.eth.get_transaction_count(self.account.address),
         })
 
         signed_tx = self.w3.eth.account.sign_transaction(tx_params, self.account.key)
@@ -330,7 +312,7 @@ class Uniswap:
             "to": self.router_address,
             "data": encoded_data,
             "value": amount_in_wei if from_token.lower() == "0x0000000000000000000000000000000000000000" else 0,
-            "nonce": NonceManager.get_next_nonce(self.w3, self.address),
+            "nonce": self.w3.eth.get_transaction_count(self.account.address),
             "gas": gas_params['estimated_total_wei'],  # Use estimated gas from gas_params
             "maxFeePerGas": gas_params['max_fee_per_gas'],
             "maxPriorityFeePerGas": gas_params['max_priority_fee_per_gas'],
