@@ -842,11 +842,11 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         else:
                             # Other errors or max retries reached
                             await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
-                            break
+                            return
 
                 await asyncio.sleep(5)  # wait before next swap
 
-            await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
+            await msg.edit_text(f"🎉 Completed {count} swaps")
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
