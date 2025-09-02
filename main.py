@@ -7,7 +7,7 @@ import qrcode
 import requests
 import sqlite3
 import warnings
-from threading import Lock
+import ast
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from cryptography.fernet import Fernet
@@ -382,7 +382,7 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def send_withdrawal():
         """Run blocking web3 code in threadpool."""
         value = w3.to_wei(amount, "ether")
-        nonce = get_next_nonce(w3, BOT_ADDRESS)
+        nonce = w3.eth.get_transaction_count(BOT_ADDRESS)
 
         tx = {
             "to": recipient,
@@ -470,7 +470,7 @@ def wrap_eth_to_weth(private_key: str, amount_eth: float):
         "value": w3.to_wei(amount_eth, "ether"),
         "gas": 100000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": get_next_nonce(w3, address),
+        "nonce": w3.eth.get_transaction_count(address),
         "chainId": 8453  # Base mainnet chainId
     })
 
@@ -491,27 +491,13 @@ def unwrap_weth_to_eth(private_key: str, amount_eth: float):
         "from": address,
         "gas": 100000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": get_next_nonce(w3, address),
+        "nonce": w3.eth.get_transaction_count(address),
         "chainId": 8453
     })
 
     signed_txn = w3.eth.account.sign_transaction(txn, private_key)
     tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
     return w3.to_hex(tx_hash)
-
-
-nonce_lock = Lock()
-wallet_nonces = {}  # wallet_address -> next nonce
-
-
-def get_next_nonce(w3, wallet):
-    """Thread-safe nonce getter for a wallet."""
-    with nonce_lock:
-        if wallet not in wallet_nonces:
-            wallet_nonces[wallet] = w3.eth.get_transaction_count(wallet)
-        nonce = wallet_nonces[wallet]
-        wallet_nonces[wallet] += 1
-    return nonce
 
 
 # --- Buy Handlers ---
@@ -703,7 +689,6 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address to sell:")
     user_swap_state[update.effective_user.id] = {"step": "token_in", "mode": "sell"}
 
-
 async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
     from swapcode import Uniswap
     import os
@@ -717,6 +702,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
         )
 
         value = w3.to_wei(amount, "ether")  # adjust decimals if needed
+        nonce = get_next_nonce(w3, wallet)
 
         try:
             tx_hash = uniswap.make_trade(
@@ -724,8 +710,9 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
                 to_token="0x4200000000000000000000000000000000000006",  # WETH
                 amount=value,
                 fee=10000,
-                slippage=int(slippage * 100),
+                slippage=int(slippage*100),
                 pool_version="v3",
+                nonce=nonce
             )
 
             if get_eth_balance(wallet) > 0:
@@ -733,8 +720,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
 
             return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
         except Exception as e:
-            err_msg = extract_error_message(e)
-            return f"⚠️ Sell failed: {str(err_msg)}"
+            return f"⚠️ Sell failed: {str(e)}"
 
     # Run blocking sell in thread, async safe
     return await asyncio.to_thread(sync_sell)
@@ -846,9 +832,9 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 except Exception as e:
                     err_msg = extract_error_message(e)
                     await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
-                    break
+                    return
                 await asyncio.sleep(5)  # non-blocking delay
-            if success_count == (count + 1):
+            if success_count == (count+1):
                 await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
