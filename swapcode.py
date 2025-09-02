@@ -3,6 +3,7 @@ from web3 import Web3
 from eth_account import Account
 from uniswap_universal_router_decoder import FunctionRecipient, RouterCodec
 import time
+from threading import Lock
 
 # 🚀 Uniswap V4 Universal Router Addresses for Each Chain
 ROUTER_ADDRESSES = {
@@ -29,6 +30,9 @@ ERC20_ABI = json.loads(ERC20_ABI_JSON)
 
 
 class Uniswap:
+    nonce_lock = Lock()
+    wallet_nonces = {}  # wallet_address -> next nonce
+
     def __init__(self, wallet_address, private_key, provider, web3):
         self.w3 = web3
         self.wallet_address = wallet_address
@@ -79,6 +83,16 @@ class Uniswap:
         token_contract = self.w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
         return token_contract.functions.decimals().call()
 
+    def get_next_nonce(self):
+        """Thread-safe nonce for this wallet."""
+        with Uniswap.nonce_lock:
+            if self.address not in Uniswap.wallet_nonces:
+                # Initialize from chain
+                Uniswap.wallet_nonces[self.address] = self.w3.eth.get_transaction_count(self.address, 'pending')
+            nonce = Uniswap.wallet_nonces[self.address]
+            Uniswap.wallet_nonces[self.address] += 1
+            return nonce
+
     def approve_permit2(self, token_address, amount):
         """
         Approve the Permit2 contract to spend tokens (one-time approval)
@@ -110,7 +124,7 @@ class Uniswap:
             "type": 2,
             "chainId": self.w3.eth.chain_id,
             "value": 0,
-            "nonce": self.w3.eth.get_transaction_count(self.account.address),
+            "nonce": self.get_next_nonce(),
         })
 
         signed_tx = self.w3.eth.account.sign_transaction(tx_params, self.account.key)
@@ -189,7 +203,7 @@ class Uniswap:
             amount (int): Amount in wei (already converted to smallest unit)
             fee (int): Fee tier (e.g., 3000 for 0.3%)
             slippage (float): Slippage tolerance in percent
-        """        # Convert addresses to checksum format
+        """  # Convert addresses to checksum format
         from_token = Web3.to_checksum_address(from_token)
 
         # Check token balance first
@@ -312,7 +326,7 @@ class Uniswap:
             "to": self.router_address,
             "data": encoded_data,
             "value": amount_in_wei if from_token.lower() == "0x0000000000000000000000000000000000000000" else 0,
-            "nonce": self.w3.eth.get_transaction_count(self.account.address),
+            "nonce": self.get_next_nonce(),
             "gas": gas_params['estimated_total_wei'],  # Use estimated gas from gas_params
             "maxFeePerGas": gas_params['max_fee_per_gas'],
             "maxPriorityFeePerGas": gas_params['max_priority_fee_per_gas'],
@@ -464,7 +478,7 @@ class Uniswap:
             has_sufficient_balance = balance >= total_gas_wei
             if not has_sufficient_balance:
                 needed_eth = Web3.from_wei(total_gas_wei - balance, "ether")
-                raise(f"⚠️ ERROR: Insufficient balance!")
+                raise (f"⚠️ ERROR: Insufficient balance!")
                 print(f"⚠️ Need {needed_eth} more ETH")
 
             return {

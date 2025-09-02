@@ -7,7 +7,7 @@ import qrcode
 import requests
 import sqlite3
 import warnings
-import ast
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from cryptography.fernet import Fernet
@@ -382,7 +382,7 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def send_withdrawal():
         """Run blocking web3 code in threadpool."""
         value = w3.to_wei(amount, "ether")
-        nonce = w3.eth.get_transaction_count(BOT_ADDRESS)
+        nonce = get_next_nonce(w3, BOT_ADDRESS)
 
         tx = {
             "to": recipient,
@@ -470,7 +470,7 @@ def wrap_eth_to_weth(private_key: str, amount_eth: float):
         "value": w3.to_wei(amount_eth, "ether"),
         "gas": 100000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": w3.eth.get_transaction_count(address),
+        "nonce": get_next_nonce(w3, address),
         "chainId": 8453  # Base mainnet chainId
     })
 
@@ -491,13 +491,27 @@ def unwrap_weth_to_eth(private_key: str, amount_eth: float):
         "from": address,
         "gas": 100000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": w3.eth.get_transaction_count(address),
+        "nonce": get_next_nonce(w3, address),
         "chainId": 8453
     })
 
     signed_txn = w3.eth.account.sign_transaction(txn, private_key)
     tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
     return w3.to_hex(tx_hash)
+
+
+nonce_lock = Lock()
+wallet_nonces = {}  # wallet_address -> next nonce
+
+
+def get_next_nonce(w3, wallet):
+    """Thread-safe nonce getter for a wallet."""
+    with nonce_lock:
+        if wallet not in wallet_nonces:
+            wallet_nonces[wallet] = w3.eth.get_transaction_count(wallet)
+        nonce = wallet_nonces[wallet]
+        wallet_nonces[wallet] += 1
+    return nonce
 
 
 # --- Buy Handlers ---
@@ -690,15 +704,49 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_swap_state[update.effective_user.id] = {"step": "token_in", "mode": "sell"}
 
 
-# --- SELL BUTTON HANDLER ---
+async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
+    from swapcode import Uniswap
+    import os
+
+    def sync_sell():
+        uniswap = Uniswap(
+            wallet_address=wallet,
+            private_key=private_key,
+            provider=os.environ.get("BASE_RPC"),
+            web3=w3
+        )
+
+        value = w3.to_wei(amount, "ether")  # adjust decimals if needed
+
+        try:
+            tx_hash = uniswap.make_trade(
+                from_token=token_in,
+                to_token="0x4200000000000000000000000000000000000006",  # WETH
+                amount=value,
+                fee=10000,
+                slippage=int(slippage * 100),
+                pool_version="v3",
+            )
+
+            if get_eth_balance(wallet) > 0:
+                unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
+
+            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+        except Exception as e:
+            err_msg = extract_error_message(e)
+            return f"⚠️ Sell failed: {str(err_msg)}"
+
+    # Run blocking sell in thread, async safe
+    return await asyncio.to_thread(sync_sell)
+
+
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
 
-    tid = update.effective_user.id
-    row = get_wallet_row(tid)
     if uid not in user_swap_state:
+        await query.edit_message_text("❌ No active sell process found.")
         return
 
     state = user_swap_state[uid]
@@ -709,74 +757,21 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     elif query.data == "confirm_sell":
-        wallet = row[1]
-        private_key = decrypt_privkey(row[2])
-
+        wallet_data = get_wallet_row(uid)
+        wallet = wallet_data[1]
+        private_key = decrypt_privkey(wallet_data[2])
         token_in = state["token_in"]
         amount = state["amount"]
 
         await query.edit_message_text("⏳ Selling token...")
 
-        async def run_sell():
-            try:
-                # Run blocking Web3 code in background thread
-                result = await asyncio.to_thread(
-                    perform_sell, wallet, private_key, token_in, amount
-                )
+        # Non-blocking sell
+        result_msg = await perform_sell(wallet, private_key, token_in, amount)
+        await context.bot.send_message(chat_id=query.message.chat_id, text=result_msg)
 
-                if result == -1:
-                    raise ValueError("Sell returned no result.")
-
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=result
-                )
-
-            except Exception as e:
-                err_msg = extract_error_message(e)
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f"⚠️ Sell failed.\nError: {err_msg}"
-                )
-            finally:
-                await asyncio.sleep(3)  # non-blocking wait
-                await show_main_menu(update, context, edit=True)
-                user_swap_state.pop(uid, None)
-
-        # Run sell without blocking bot
-        asyncio.create_task(run_sell())
-
-
-def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
-    uniswap = Uniswap(
-        wallet_address=wallet,
-        private_key=private_key,
-        provider=os.environ.get("BASE_RPC"),
-        web3=w3
-    )
-
-    try:
-        value = w3.to_wei(amount, "ether")  # assumes 18 decimals
-        tx_hash = uniswap.make_trade(
-            from_token=token_in,
-            to_token="0x4200000000000000000000000000000000000006",  # WETH
-            amount=value,
-            fee=10000,
-            slippage=2,
-            pool_version="v3"
-        )
-        print(f"Sell transaction sent! Tx hash: {tx_hash.hex()}")
-
-        # (don’t block, leave confirmation to backend / explorer)
-        if get_eth_balance(wallet) > 0:
-            unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
-
-        return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
-
-    except Exception as e:
-        err_msg = extract_error_message(e)
-        print(f"Sell failed: {err_msg}")
-        return -1
+        # Show main menu
+        await show_main_menu(update, context, edit=True)
+        user_swap_state.pop(uid, None)
 
 
 # ================= TXNBOT MULTIPLE SWAPS ================= #
@@ -853,7 +848,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await msg.edit_text(f"⚠️ Swap {i + 1} failed: {err_msg}")
                     return
                 await asyncio.sleep(5)  # non-blocking delay
-            if success_count == (count+1):
+            if success_count == (count + 1):
                 await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
