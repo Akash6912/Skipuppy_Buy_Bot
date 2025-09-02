@@ -691,9 +691,6 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
-    from swapcode import Uniswap
-    import os
-
     def sync_sell():
         uniswap = Uniswap(
             wallet_address=wallet,
@@ -717,7 +714,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
             if get_eth_balance(wallet) > 0:
                 unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
 
-            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/{tx_hash.hex()}"
+            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
         except Exception as e:
             return f"⚠️ Sell failed: {str(e)}"
 
