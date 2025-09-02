@@ -845,6 +845,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
                 except Exception as e:
                     await msg.edit_text(f"⚠️ Swap {i + 1} failed: {e}")
+                    break
                 await asyncio.sleep(5)  # non-blocking delay
 
             await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
