@@ -840,6 +840,24 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         user_swap_state.pop(uid, None)
                         return
 
+                    # ✅ Pre-check balance before attempting swap
+                    try:
+                        balance = w3.eth.get_balance(wallet)
+                        # require enough for swap + gas
+                        min_required = w3.to_wei(amount, "ether") + w3.to_wei(0.000005, "ether")
+                        if balance < min_required:
+                            await msg.edit_text(
+                                f"❌ Stopping at swap {i + 1}/{count}: not enough ETH "
+                                f"(have {w3.from_wei(balance, 'ether')} ETH, need {w3.from_wei(min_required, 'ether')} ETH)"
+                            )
+                            await asyncio.sleep(3)
+                            await show_main_menu(update, context, edit=True)
+                            user_swap_state.pop(uid, None)
+                            return
+                    except Exception as bal_err:
+                        await msg.edit_text(f"⚠️ Balance check failed: {str(bal_err)}")
+                        return
+
                     try:
                         result = await with_user_lock(
                             uid,
