@@ -926,7 +926,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await safe_edit(uid, query.from_user.username, msg, f"🎉 Completed {success_count}/{count} swaps")
             # ✅ Clean up user's past errors if all swaps finished
             if success_count == count:
-                clear_user_errors(uid)
+                clear_user_errors(uid, query.from_user.username)
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
@@ -946,25 +946,21 @@ def git_commit_and_push(file_path: str, message: str = "Update swap_errors.txt")
     except subprocess.CalledProcessError as e:
         print(f"[⚠️ Git Push Failed] {str(e)}")
 
+
 def log_error_to_file(uid: int, username: str, msg: str):
     """Append errors to a log file with user details + timestamp."""
+    file_path = os.path.join(GIT_REPO_PATH, ERROR_LOG_FILE)
     with open(ERROR_LOG_FILE, "a") as f:
         f.write(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
             f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
         )
+    git_commit_and_push(file_path, f"Log error for user {username or uid}")
 
 
-def log_error_to_file(uid: int, username: str, msg: str):
-    """Append errors to a log file with user details + timestamp."""
-    with open(ERROR_LOG_FILE, "a") as f:
-        f.write(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-            f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
-        )
-
-def clear_user_errors(uid: int):
+def clear_user_errors(uid: int, username: str):
     """Remove all error logs related to a specific user from the file."""
+    file_path = os.path.join(GIT_REPO_PATH, ERROR_LOG_FILE)
     if not os.path.exists(ERROR_LOG_FILE):
         return
     with open(ERROR_LOG_FILE, "r") as f:
@@ -979,6 +975,7 @@ def clear_user_errors(uid: int):
                 continue
             if not skip:
                 f.write(line)
+    git_commit_and_push(file_path, f"Clear errors for user {username or uid}")
 
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
