@@ -861,7 +861,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         # Run swap with timeout
                         result = await asyncio.wait_for(
                             with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
-                            timeout=60
+                            timeout=120
                         )
 
                         if not result:
