@@ -1,3 +1,4 @@
+import subprocess
 import time
 import traceback
 import aiohttp
@@ -32,6 +33,7 @@ load_dotenv(override=True)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ERROR_LOG_FILE = "swap_errors.txt"
+GIT_REPO_PATH = os.environ.get("GITHUB_PATH")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -610,8 +612,8 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def do_buy(wallet, private_key, token_out, amount):
-    if get_eth_balance(wallet) < (amount * 2):
-        tx = wrap_eth_to_weth(private_key, amount * 2)
+    if get_eth_balance(wallet) <= (amount * 5):
+        tx = wrap_eth_to_weth(private_key, amount * 5)
     time.sleep(1)
 
     uniswap = Uniswap(
@@ -823,8 +825,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_swap_state[uid]["cancel"] = False
 
         # ✅ Pre-check balance before starting
-        if get_eth_balance(wallet) < (amount * 2):
-            tx = wrap_eth_to_weth(private_key, amount * 2)
+        if get_eth_balance(wallet) <= (amount * 5):
+            tx = wrap_eth_to_weth(private_key, amount * (count/2))
         try:
             balance = w3.eth.get_balance(wallet) / 1e18  # ETH balance
             if balance < amount * count:
@@ -935,6 +937,15 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ================= Cancel Handler ================= #
+def git_commit_and_push(file_path: str, message: str = "Update swap_errors.txt"):
+    """Commit and push changes to GitHub."""
+    try:
+        subprocess.run(["git", "add", file_path], cwd=GIT_REPO_PATH, check=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=GIT_REPO_PATH, check=True)
+        subprocess.run(["git", "push"], cwd=GIT_REPO_PATH, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[⚠️ Git Push Failed] {str(e)}")
+
 def log_error_to_file(uid: int, username: str, msg: str):
     """Append errors to a log file with user details + timestamp."""
     with open(ERROR_LOG_FILE, "a") as f:
