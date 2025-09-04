@@ -610,8 +610,8 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def do_buy(wallet, private_key, token_out, amount):
-    if get_eth_balance(wallet) < (amount*2):
-        tx = wrap_eth_to_weth(private_key, amount*2)
+    if get_eth_balance(wallet) < (amount * 2):
+        tx = wrap_eth_to_weth(private_key, amount * 2)
     time.sleep(1)
 
     uniswap = Uniswap(
@@ -823,6 +823,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_swap_state[uid]["cancel"] = False
 
         # ✅ Pre-check balance before starting
+        if get_eth_balance(wallet) < (amount * 2):
+            tx = wrap_eth_to_weth(private_key, amount * 2)
         try:
             balance = w3.eth.get_balance(wallet) / 1e18  # ETH balance
             if balance < amount * count:
@@ -850,7 +852,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 while True:
                     # 🛑 Check cancel flag
                     if user_swap_state.get(uid, {}).get("cancel"):
-                        await safe_edit(uid, query.from_user.username, uid, query, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
+                        await safe_edit(uid, query.from_user.username, uid, query, msg,
+                                        f"🛑 Swap cancelled at {i + 1}/{count}")
                         user_swap_state.pop(uid, None)
                         return
 
@@ -904,7 +907,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                 except Exception as nonce_err:
                                     log_error_to_file(uid, query.from_user.username,
                                                       f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
-                                    await safe_edit(uid, query.from_user.username, msg, f"⚠️ Failed to resync nonce: {str(nonce_err)}")
+                                    await safe_edit(uid, query.from_user.username, msg,
+                                                    f"⚠️ Failed to resync nonce: {str(nonce_err)}")
                         else:
                             await safe_edit(
                                 uid, query.from_user.username,
@@ -926,6 +930,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         return
 
+
 # ================= Cancel Handler ================= #
 def log_error_to_file(uid: int, username: str, msg: str):
     """Append errors to a log file with user details + timestamp."""
@@ -935,12 +940,14 @@ def log_error_to_file(uid: int, username: str, msg: str):
             f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
         )
 
+
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
     try:
         await msg.edit_text(text)
     except Exception as e:
         log_error_to_file(uid, q, f"[⚠️ Telegram Edit Failed] {str(e)}")
+
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
