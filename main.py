@@ -846,7 +846,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # ✅ Pre-check balance before starting
         if get_eth_balance(wallet) <= (amount * 5):
-            tx = wrap_eth_to_weth(private_key, amount * (count/2))
+            tx = wrap_eth_to_weth(private_key, amount * (count / 2))
         try:
             balance = w3.eth.get_balance(wallet) / 1e18  # ETH balance
             if balance < amount * count:
@@ -996,6 +996,7 @@ def clear_user_errors(uid: int, username: str):
             if not skip:
                 f.write(line)
     git_commit_and_push(file_path, f"Clear errors for user {username or uid}")
+
 
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
