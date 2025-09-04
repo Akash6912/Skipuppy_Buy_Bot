@@ -11,7 +11,7 @@ import requests
 import sqlite3
 import warnings
 import ast
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime
 from io import BytesIO
 from cryptography.fernet import Fernet
@@ -612,27 +612,47 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def do_buy(wallet, private_key, token_out, amount):
-    if get_eth_balance(wallet) <= (amount * 5):
-        tx = wrap_eth_to_weth(private_key, amount * 5)
-    time.sleep(1)
+    try:
+        # Auto-wrap if balance is low
+        if get_eth_balance(wallet) <= (amount * 5):
+            tx = wrap_eth_to_weth(private_key, amount * 5)
 
-    uniswap = Uniswap(
-        wallet_address=wallet,
-        private_key=private_key,
-        provider=os.environ.get("BASE_RPC"),
-        web3=w3
-    )
+        time.sleep(1)
 
-    value = w3.to_wei(amount, "ether")
-    tx_hash = uniswap.make_trade(
-        from_token="0x4200000000000000000000000000000000000006",
-        to_token=token_out,
-        amount=value,
-        fee=10000,
-        slippage=2,
-        pool_version="v3"
-    )
-    return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+        uniswap = Uniswap(
+            wallet_address=wallet,
+            private_key=private_key,
+            provider=os.environ.get("BASE_RPC"),
+            web3=w3
+        )
+
+        value = w3.to_wei(amount, "ether")
+
+        # --- Function to run the trade ---
+        def run_trade():
+            return uniswap.make_trade(
+                from_token="0x4200000000000000000000000000000000000006",  # WETH
+                to_token=token_out,
+                amount=value,
+                fee=10000,
+                slippage=2,
+                pool_version="v3"
+            )
+
+        # Submit to global executor
+        future = executor.submit(run_trade)
+        try:
+            tx_hash = future.result(timeout=30)  # wait max 30s
+        except TimeoutError:
+            raise Exception("⚠️ Swap stuck: RPC timeout (>30s)")
+
+        if not tx_hash:
+            raise Exception("❌ Swap failed: no tx hash returned")
+
+        return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+
+    except Exception as e:
+        raise Exception(f"do_buy failed: {str(e)}") from e
 
 
 async def with_user_lock(uid, coro):
@@ -862,7 +882,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     try:
                         # Run swap with timeout
                         result = await asyncio.wait_for(
-                            with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
+                            asyncio.to_thread(perform_buy, wallet, private_key, token_out, amount),
                             timeout=120
                         )
 
