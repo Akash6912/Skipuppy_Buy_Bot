@@ -852,7 +852,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 while True:
                     # 🛑 Check cancel flag
                     if user_swap_state.get(uid, {}).get("cancel"):
-                        await safe_edit(uid, query.from_user.username, uid, query, msg,
+                        await safe_edit(uid, query.from_user.username, msg,
                                         f"🛑 Swap cancelled at {i + 1}/{count}")
                         user_swap_state.pop(uid, None)
                         return
@@ -922,6 +922,9 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await asyncio.sleep(5)
 
             await safe_edit(uid, query.from_user.username, msg, f"🎉 Completed {success_count}/{count} swaps")
+            # ✅ Clean up user's past errors if all swaps finished
+            if success_count == count:
+                clear_user_errors(uid)
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
@@ -940,6 +943,31 @@ def log_error_to_file(uid: int, username: str, msg: str):
             f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
         )
 
+
+def log_error_to_file(uid: int, username: str, msg: str):
+    """Append errors to a log file with user details + timestamp."""
+    with open(ERROR_LOG_FILE, "a") as f:
+        f.write(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
+        )
+
+def clear_user_errors(uid: int):
+    """Remove all error logs related to a specific user from the file."""
+    if not os.path.exists(ERROR_LOG_FILE):
+        return
+    with open(ERROR_LOG_FILE, "r") as f:
+        lines = f.readlines()
+    with open(ERROR_LOG_FILE, "w") as f:
+        skip = False
+        for line in lines:
+            if f"(ID: {uid})" in line:
+                skip = True  # start skipping this block
+            elif skip and line.strip() == "":
+                skip = False  # stop skipping after blank line
+                continue
+            if not skip:
+                f.write(line)
 
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
