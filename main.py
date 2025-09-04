@@ -1,5 +1,5 @@
 import subprocess
-import time
+import random
 import traceback
 import aiohttp
 import asyncio
@@ -11,7 +11,7 @@ import requests
 import sqlite3
 import warnings
 import ast
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import BytesIO
 from cryptography.fernet import Fernet
@@ -611,49 +611,74 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("⚠️ Invalid number. Enter an integer.")
 
 
-def do_buy(wallet, private_key, token_out, amount):
-    try:
-        # Auto-wrap if balance is low
-        if get_eth_balance(wallet) <= (amount * 5):
-            tx = wrap_eth_to_weth(private_key, amount * 5)
+# List of RPCs for failover
+RPC_LIST = [
+    os.environ.get("BASE_RPC"),          # your primary
+    "https://mainnet.base.org",          # backup 2
+]
 
-        time.sleep(1)
+# --- Sync Buy Logic --- #
+def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
+    """Synchronous logic that performs one buy trade using a given RPC"""
+    # Wrap ETH to WETH if balance too low
+    if get_eth_balance(wallet) <= (amount * 5):
+        wrap_eth_to_weth(private_key, amount * 5)
 
-        uniswap = Uniswap(
-            wallet_address=wallet,
-            private_key=private_key,
-            provider=os.environ.get("BASE_RPC"),
-            web3=w3
-        )
+    uniswap = Uniswap(
+        wallet_address=wallet,
+        private_key=private_key,
+        provider=rpc_url,
+        web3=w3
+    )
 
-        value = w3.to_wei(amount, "ether")
+    value = w3.to_wei(amount, "ether")
 
-        # --- Function to run the trade ---
-        def run_trade():
-            return uniswap.make_trade(
-                from_token="0x4200000000000000000000000000000000000006",  # WETH
-                to_token=token_out,
-                amount=value,
-                fee=10000,
-                slippage=2,
-                pool_version="v3"
-            )
+    # Normal trade (Uniswap will manage nonce internally)
+    tx_hash = uniswap.make_trade(
+        from_token="0x4200000000000000000000000000000000000006",  # WETH on Base
+        to_token=token_out,
+        amount=value,
+        fee=10000,
+        slippage=2,
+        pool_version="v3"
+    )
+    return tx_hash.hex()
 
-        # Submit to global executor
-        future = executor.submit(run_trade)
+
+# --- Async Wrapper with Retries + Failover --- #
+async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
+    loop = asyncio.get_running_loop()
+    delay = 5  # initial retry delay (seconds)
+
+    # rotate through RPCs on retries
+    for attempt in range(1, max_retries + 1):
+        rpc_url = RPC_LIST[(attempt - 1) % len(RPC_LIST)]
+
         try:
-            tx_hash = future.result(timeout=30)  # wait max 30s
-        except TimeoutError:
-            raise Exception("⚠️ Swap stuck: RPC timeout (>30s)")
+            # Run the blocking trade in executor, with timeout
+            tx_hash = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executor,
+                    do_buy_sync,
+                    wallet, private_key, token_out, amount, rpc_url
+                ),
+                timeout=90  # ⏳ 90s timeout per trade
+            )
+            return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash}"
 
-        if not tx_hash:
-            raise Exception("❌ Swap failed: no tx hash returned")
+        except asyncio.TimeoutError:
+            if attempt == max_retries:
+                raise Exception(f"Swap timed out after {max_retries} attempts (last RPC: {rpc_url})")
+            print(f"[WARN] Swap timed out (attempt {attempt}, RPC={rpc_url}), retrying in {delay}s...")
 
-        return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            print(f"[WARN] Swap failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
 
-    except Exception as e:
-        raise Exception(f"do_buy failed: {str(e)}") from e
-
+        # Exponential backoff with jitter
+        await asyncio.sleep(delay + random.uniform(0, 3))
+        delay = min(delay * 2, 60)  # cap at 60s
 
 async def with_user_lock(uid, coro):
     """Ensure one user's swaps run sequentially, but allow concurrency across users."""
@@ -661,12 +686,6 @@ async def with_user_lock(uid, coro):
         user_locks[uid] = asyncio.Lock()
     async with user_locks[uid]:
         return await coro
-
-
-# --- PERFORM BUY --- #
-async def perform_buy(wallet, private_key, token_out, amount):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, do_buy, wallet, private_key, token_out, amount)
 
 
 # ================= Sell Handler ================= #
@@ -846,7 +865,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # ✅ Pre-check balance before starting
         if get_eth_balance(wallet) <= (amount * 5):
-            tx = wrap_eth_to_weth(private_key, amount * (count / 2))
+            tx = wrap_eth_to_weth(private_key, amount * (count/2))
         try:
             balance = w3.eth.get_balance(wallet) / 1e18  # ETH balance
             if balance < amount * count:
@@ -882,7 +901,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     try:
                         # Run swap with timeout
                         result = await asyncio.wait_for(
-                            asyncio.to_thread(perform_buy, wallet, private_key, token_out, amount),
+                            with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
                             timeout=120
                         )
 
@@ -996,7 +1015,6 @@ def clear_user_errors(uid: int, username: str):
             if not skip:
                 f.write(line)
     git_commit_and_push(file_path, f"Clear errors for user {username or uid}")
-
 
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
