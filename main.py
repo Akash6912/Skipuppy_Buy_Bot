@@ -1,5 +1,5 @@
 import time
-
+import traceback
 import aiohttp
 import asyncio
 import json
@@ -11,6 +11,7 @@ import sqlite3
 import warnings
 import ast
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from io import BytesIO
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 load_dotenv(override=True)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+ERROR_LOG_FILE = "swap_errors.txt"
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -814,11 +816,25 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # ---------------- MULTIPLE SWAPS ---------------- #
     elif query.data == "confirm_txnbot" and state.get("mode") == "txnbot":
         token_out = state["token_out"]
-        amount = state["amount"]
+        amount = state["amount"]  # in ETH
         count = state["count"]
 
         # set cancel flag
         user_swap_state[uid]["cancel"] = False
+
+        # ✅ Pre-check balance before starting
+        try:
+            balance = w3.eth.get_balance(wallet) / 1e18  # ETH balance
+            if balance < amount * count:
+                await query.edit_message_text(
+                    f"❌ Insufficient balance.\n\nYou need at least {amount * count:.6f} ETH "
+                    f"for {count} swaps, but only have {balance:.6f} ETH."
+                )
+                return
+        except Exception as e:
+            log_error_to_file(uid, query.from_user.username, f"Balance check failed: {str(e)}")
+            await query.edit_message_text("⚠️ Could not fetch balance, aborting swaps.")
+            return
 
         await query.edit_message_text(f"⏳ Starting {count} swaps...")
         msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
@@ -827,52 +843,41 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             success_count = 0
 
             for i in range(count):
-                retry_delay = 3
+                retry_delay = 5
                 attempt = 0
                 nonetype_failures = 0
 
                 while True:
                     # 🛑 Check cancel flag
                     if user_swap_state.get(uid, {}).get("cancel"):
-                        await msg.edit_text(f"🛑 Swap cancelled at {i + 1}/{count}")
-                        await asyncio.sleep(3)
-                        await show_main_menu(update, context, edit=True)
+                        await safe_edit(uid, query.from_user.username, uid, query, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
                         user_swap_state.pop(uid, None)
                         return
 
-                    # ✅ Pre-check balance before attempting swap
                     try:
-                        balance = w3.eth.get_balance(wallet)
-                        # require enough for swap + gas
-                        min_required = w3.to_wei(amount, "ether") + w3.to_wei(0.000005, "ether")
-                        if balance < min_required:
-                            await msg.edit_text(
-                                f"❌ Stopping at swap {i + 1}/{count}: not enough ETH "
-                                f"(have {w3.from_wei(balance, 'ether')} ETH, need {w3.from_wei(min_required, 'ether')} ETH)"
-                            )
-                            await asyncio.sleep(3)
-                            await show_main_menu(update, context, edit=True)
-                            user_swap_state.pop(uid, None)
-                            return
-                    except Exception as bal_err:
-                        await msg.edit_text(f"⚠️ Balance check failed: {str(bal_err)}")
-                        return
-
-                    try:
-                        result = await with_user_lock(
-                            uid,
-                            perform_buy(wallet, private_key, token_out, amount)
+                        # Run swap with timeout
+                        result = await asyncio.wait_for(
+                            with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
+                            timeout=60
                         )
+
+                        if not result:
+                            raise Exception("Swap failed: no tx hash returned")
+
                         success_count += 1
-                        await msg.edit_text(f"✅ Swap {i + 1}/{count} done")
+                        await safe_edit(uid, query.from_user.username, msg, f"✅ Swap {i + 1}/{count} done")
                         break
 
                     except Exception as e:
+                        tb = traceback.format_exc()
+                        log_error_to_file(uid, query.from_user.username, f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
                         err_msg = extract_error_message(e).lower()
                         attempt += 1
 
                         if "insufficient" in err_msg or "not enough balance" in err_msg:
-                            await msg.edit_text(
+                            await safe_edit(
+                                uid, query.from_user.username,
+                                msg,
                                 f"❌ Swap {i + 1} failed: {err_msg}\n\n💡 Stopping bot (insufficient balance)."
                             )
                             await asyncio.sleep(3)
@@ -882,20 +887,28 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
                         if "nonetype" in err_msg and "hex" in err_msg:
                             nonetype_failures += 1
-                            await msg.edit_text(
+                            await safe_edit(
+                                uid, query.from_user.username,
+                                msg,
                                 f"⚠️ Swap {i + 1} failed: missing tx hash (attempt {attempt}), retrying in {retry_delay}s..."
                             )
                             if nonetype_failures >= 3:
                                 try:
                                     fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
-                                    await msg.edit_text(
+                                    await safe_edit(
+                                        uid, query.from_user.username,
+                                        msg,
                                         f"🔄 Resynced nonce to {fresh_nonce} for wallet.\nRetrying swap {i + 1}..."
                                     )
                                     nonetype_failures = 0
                                 except Exception as nonce_err:
-                                    await msg.edit_text(f"⚠️ Failed to resync nonce: {str(nonce_err)}")
+                                    log_error_to_file(uid, query.from_user.username,
+                                                      f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
+                                    await safe_edit(uid, query.from_user.username, msg, f"⚠️ Failed to resync nonce: {str(nonce_err)}")
                         else:
-                            await msg.edit_text(
+                            await safe_edit(
+                                uid, query.from_user.username,
+                                msg,
                                 f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s..."
                             )
 
@@ -904,7 +917,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
                 await asyncio.sleep(5)
 
-            await msg.edit_text(f"🎉 Completed {success_count}/{count} swaps")
+            await safe_edit(uid, query.from_user.username, msg, f"🎉 Completed {success_count}/{count} swaps")
             await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
@@ -914,6 +927,21 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
 # ================= Cancel Handler ================= #
+def log_error_to_file(uid: int, username: str, msg: str):
+    """Append errors to a log file with user details + timestamp."""
+    with open(ERROR_LOG_FILE, "a") as f:
+        f.write(
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
+        )
+
+async def safe_edit(uid, q, msg, text):
+    """Safe wrapper for Telegram message edits."""
+    try:
+        await msg.edit_text(text)
+    except Exception as e:
+        log_error_to_file(uid, q, f"[⚠️ Telegram Edit Failed] {str(e)}")
+
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid in user_swap_state:
