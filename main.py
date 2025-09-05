@@ -621,8 +621,13 @@ RPC_LIST = [
 def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     """Synchronous logic that performs one buy trade using a given RPC"""
     # Wrap ETH to WETH if balance too low
-    if get_eth_balance(wallet) <= (amount * 5):
+    if (get_eth_balance(wallet) <= (amount * 5)) && state.get("mode") == "txnbot":
         wrap_eth_to_weth(private_key, amount * 5)
+        time.sleep(2)
+
+    if state.get("mode") == "buy":
+        wrap_eth_to_weth(private_key, amount)
+        time.sleep(2)
 
     uniswap = Uniswap(
         wallet_address=wallet,
