@@ -756,7 +756,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
                 pool_version="v3",
             )
 
-            await asyncio.sleep(3)
+            time.sleep(3)
             unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
 
             return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
