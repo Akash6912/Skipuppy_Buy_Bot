@@ -618,14 +618,14 @@ RPC_LIST = [
 ]
 
 # --- Sync Buy Logic --- #
-def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
+def do_buy_sync(wallet, private_key, token_out, amount, rpc_url, state):
     """Synchronous logic that performs one buy trade using a given RPC"""
     # Wrap ETH to WETH if balance too low
-    if (get_eth_balance(wallet) <= (amount * 5)) and state.get("mode") == "txnbot":
+    if (get_eth_balance(wallet) <= (amount * 5)) and state == "txnbot":
         wrap_eth_to_weth(private_key, amount * 5)
         time.sleep(2)
 
-    if state.get("mode") == "buy":
+    if state == "buy":
         wrap_eth_to_weth(private_key, amount)
         time.sleep(2)
 
@@ -651,7 +651,7 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
 
 
 # --- Async Wrapper with Retries + Failover --- #
-async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
+async def perform_buy(wallet, private_key, token_out, amount, state, max_retries=3):
     loop = asyncio.get_running_loop()
     delay = 5  # initial retry delay (seconds)
 
@@ -665,7 +665,7 @@ async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
                 loop.run_in_executor(
                     executor,
                     do_buy_sync,
-                    wallet, private_key, token_out, amount, rpc_url
+                    wallet, private_key, token_out, amount, rpc_url, state
                 ),
                 timeout=90  # ⏳ 90s timeout per trade
             )
@@ -845,7 +845,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         async def task():
             try:
                 # Lock ensures no overlapping swaps for SAME user
-                result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
+                result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount, state.get("mode")))
                 await context.bot.send_message(chat_id=query.message.chat_id, text=result)
             except Exception as e:
                 err_msg = extract_error_message(e)
@@ -906,7 +906,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     try:
                         # Run swap with timeout
                         result = await asyncio.wait_for(
-                            with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
+                            with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount, state.get("mode"))),
                             timeout=120
                         )
 
