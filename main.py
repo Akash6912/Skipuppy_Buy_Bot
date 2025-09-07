@@ -880,7 +880,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(f"⏳ Starting {count} swaps...")
         msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
 
-        asyncio.create_task(run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context, update, query))
+        asyncio.create_task(run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context))
 
         return
 
@@ -1227,7 +1227,7 @@ async def set_commands(app):
 
 async def on_startup(app):
     print("🚀 Bot starting... checking for unfinished swaps...")
-    await auto_resume_all(app.bot)
+    await auto_resume_all(app)
 
 
 # ================= Main ================= #
