@@ -880,7 +880,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(f"⏳ Starting {count} swaps...")
         msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
 
-        asyncio.create_task(run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context, update))
+        asyncio.create_task(run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context, update, query))
 
         return
 
@@ -909,7 +909,7 @@ def load_progress(uid):
 
 
 # ------------------- RESUMABLE SWAP LOOP ------------------- #
-async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_index=0, context=None, update=None):
+async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_index=0, context=None, update=None, query=None):
     success_count = start_index
     msg = None
     balance = get_eth_balance(wallet)
@@ -923,7 +923,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
         while True:
             if user_swap_state.get(uid, {}).get("cancel"):
                 if msg:
-                    await safe_edit(uid, update.effective_user.username, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
+                    await safe_edit(uid, query.from_user.username, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
                 if balance > 0:
                     unwrap_weth_to_eth(private_key, balance)
                 user_swap_state.pop(uid, None)
@@ -943,7 +943,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                 success_count += 1
 
                 if msg:
-                    await safe_edit(uid, update.effective_user.username, msg, f"✅ Swap {i + 1}/{count}")
+                    await safe_edit(uid, query.from_user.username, msg, f"✅ Swap {i + 1}/{count}")
                 else:
                     msg = await context.bot.send_message(
                         chat_id=uid,
@@ -963,7 +963,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
                 if "insufficient" in err_msg or "not enough balance" in err_msg:
                     if msg:
-                        await safe_edit(uid, update.effective_user.username, msg,
+                        await safe_edit(uid, query.from_user.username, msg,
                                         f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
                     user_swap_state.pop(uid, None)
                     return
@@ -972,14 +972,14 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                     try:
                         fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
                         if msg:
-                            await safe_edit(uid, update.effective_user.username, msg,
+                            await safe_edit(uid, query.from_user.username, msg,
                                             f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
                     except Exception as nonce_err:
                         log_error_to_file(uid, update.effective_user.username,
                                           f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
 
                 if msg:
-                    await safe_edit(uid, update.effective_user.username, msg,
+                    await safe_edit(uid, query.from_user.username, msg,
                                     f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s...")
 
                 await asyncio.sleep(retry_delay)
@@ -992,7 +992,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
         pass
 
     if msg:
-        await safe_edit(uid, update.effective_user.username, msg, f"🎉 Completed {success_count}/{count} swaps")
+        await safe_edit(uid, query.from_user.username, msg, f"🎉 Completed {success_count}/{count} swaps")
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(3)
