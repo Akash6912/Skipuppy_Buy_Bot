@@ -1053,22 +1053,23 @@ async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"[WARN] Failed to notify user from {file}: {e}")
 
-
-def setup_shutdown_handler(application: Application):
-    """
-    Notify users on server shutdown (Ctrl+C or SIGTERM)
-    """
+def setup_shutdown_handler(app: Application):
     loop = asyncio.get_event_loop()
 
+    async def shutdown_sequence():
+        print("[INFO] Bot is shutting down, notifying users...")
+        await notify_shutdown(app)
+        await asyncio.sleep(1)  # wait a moment to ensure messages are sent
+        await app.stop()
+        print("[INFO] Shutdown complete.")
+
     def handler(sig, frame):
-        print(f"[INFO] Received shutdown signal ({sig})")
-        # Schedule async shutdown notification
-        loop.create_task(notify_shutdown(application))
-        # Stop the bot gracefully after a short delay to allow messages to send
-        loop.call_later(3, lambda: loop.create_task(application.stop()))
+        print(f"[INFO] Received signal {sig}, starting shutdown sequence...")
+        asyncio.create_task(shutdown_sequence())
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
+
 
 
 # ================= Cancel Handler ================= #
