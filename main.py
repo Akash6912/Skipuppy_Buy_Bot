@@ -963,7 +963,8 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
                 if "insufficient" in err_msg or "not enough balance" in err_msg:
                     if msg:
-                        await safe_edit(uid, update.effective_user.username, msg, f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
+                        await safe_edit(uid, update.effective_user.username, msg,
+                                        f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
                     user_swap_state.pop(uid, None)
                     return
 
@@ -971,12 +972,15 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                     try:
                         fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
                         if msg:
-                            await safe_edit(uid, update.effective_user.username, msg, f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
+                            await safe_edit(uid, update.effective_user.username, msg,
+                                            f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
                     except Exception as nonce_err:
-                        log_error_to_file(uid, update.effective_user.username, f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
+                        log_error_to_file(uid, update.effective_user.username,
+                                          f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
 
                 if msg:
-                    await safe_edit(uid, update.effective_user.username, msg, f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s...")
+                    await safe_edit(uid, update.effective_user.username, msg,
+                                    f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s...")
 
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 10)
@@ -1025,6 +1029,7 @@ async def auto_resume_all(context):
                 run_swaps(uid, wallet, private_key, token_out, amount, count, start_index, context)
             )
 
+
 # ================= Shutdown Handlers ================= #
 async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1048,15 +1053,21 @@ async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"[WARN] Failed to notify user from {file}: {e}")
 
+
 def setup_shutdown_handler(application):
     """
     Hook into server shutdown to notify users before the bot stops.
     """
+
     def handle_signal(sig, frame):
-        loop = asyncio.get_event_loop()
         print(f"[INFO] Received shutdown signal ({sig}). Notifying users...")
-        loop.create_task(notify_shutdown(application))
-        loop.create_task(application.stop())  # Stop the bot gracefully
+
+        loop = asyncio.get_running_loop()
+        # Schedule notify_shutdown safely from signal handler
+        asyncio.run_coroutine_threadsafe(notify_shutdown(application), loop)
+
+        # Stop the bot after a short delay to ensure messages are sent
+        loop.call_later(2, lambda: asyncio.run_coroutine_threadsafe(application.stop(), loop))
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -1218,6 +1229,7 @@ async def set_commands(app):
 async def on_startup(app):
     print("🚀 Bot starting... checking for unfinished swaps...")
     await auto_resume_all(app.bot)
+
 
 # ================= Main ================= #
 def main():
