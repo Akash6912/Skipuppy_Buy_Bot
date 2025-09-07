@@ -956,7 +956,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
             except Exception as e:
                 tb = traceback.format_exc()
-                log_error_to_file(uid, update.effective_user.username, f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
+                log_error_to_file(uid, query.from_user.username, f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
                 attempt += 1
 
                 err_msg = extract_error_message(e).lower()
@@ -975,7 +975,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                             await safe_edit(uid, query.from_user.username, msg,
                                             f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
                     except Exception as nonce_err:
-                        log_error_to_file(uid, update.effective_user.username,
+                        log_error_to_file(uid, query.from_user.username,
                                           f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
 
                 if msg:
