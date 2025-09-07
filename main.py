@@ -970,7 +970,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                         if msg:
                             await safe_edit(uid, None, msg, f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
                     except Exception as nonce_err:
-                        log_error_to_file(uid, None, f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
+                        log_error_to_file(uid, update.effective_user.username, f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
 
                 if msg:
                     await safe_edit(uid, None, msg, f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s...")
