@@ -1,4 +1,3 @@
-import subprocess
 import random
 import traceback
 import aiohttp
@@ -11,6 +10,7 @@ import requests
 import sqlite3
 import warnings
 import ast
+import signal
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import BytesIO
@@ -613,9 +613,10 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # List of RPCs for failover
 RPC_LIST = [
-    os.environ.get("BASE_RPC"),          # your primary
-    "https://mainnet.base.org",          # backup 2
+    os.environ.get("BASE_RPC"),  # your primary
+    "https://mainnet.base.org",  # backup 2
 ]
+
 
 # --- Sync Buy Logic --- #
 def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
@@ -679,6 +680,7 @@ async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
         # exponential backoff with jitter
         await asyncio.sleep(delay + random.uniform(0, 2))
         delay = min(delay * 2, 60)
+
 
 async def with_user_lock(uid, coro):
     """Ensure one user's swaps run sequentially, but allow concurrency across users."""
@@ -854,16 +856,14 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         asyncio.create_task(task())
         return
 
-    # ---------------- MULTIPLE SWAPS ---------------- #
+    # ------------------- START MULTI SWAPS ------------------- #
     elif query.data == "confirm_txnbot" and state.get("mode") == "txnbot":
         token_out = state["token_out"]
         amount = state["amount"]  # in ETH
         count = state["count"]
 
-        # set cancel flag
         user_swap_state[uid]["cancel"] = False
 
-        # ✅ Pre-check ETH balance before starting
         try:
             balance = w3.eth.get_balance(wallet) / 1e18
             if balance < amount * count:
@@ -877,89 +877,184 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("⚠️ Could not fetch balance, aborting swaps.")
             return
 
-        if get_eth_balance(wallet) <= (amount * 5):
-            wrap_eth_to_weth(private_key, amount * count)
         await query.edit_message_text(f"⏳ Starting {count} swaps...")
         msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
 
-        async def task():
-            success_count = 0
-            for i in range(count):
-                retry_delay = 1  # ⏳ faster retry
-                attempt = 0
-                nonetype_failures = 0
-
-                while True:
-                    if user_swap_state.get(uid, {}).get("cancel"):
-                        await safe_edit(uid, query.from_user.username, msg,
-                                        f"🛑 Swap cancelled at {i + 1}/{count}")
-                        user_swap_state.pop(uid, None)
-                        return
-                    try:
-                        # 🔑 always use pending nonce
-                        fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
-
-                        # run swap (returns tx hash immediately after broadcast)
-                        tx_hash = await asyncio.wait_for(
-                            with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
-                            timeout=30
-                        )
-
-                        if not tx_hash:
-                            raise Exception("Swap failed: no tx hash returned")
-
-                        success_count += 1
-                        await safe_edit(
-                            uid, query.from_user.username, msg,
-                            f"✅ Swap {i + 1}/{count}"
-                        )
-
-                        # 🚀 go directly to next iteration (no sleep!)
-                        break
-
-                    except Exception as e:
-                        tb = traceback.format_exc()
-                        log_error_to_file(uid, query.from_user.username,
-                                          f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
-                        err_msg = extract_error_message(e).lower()
-                        attempt += 1
-
-                        if "insufficient" in err_msg or "not enough balance" in err_msg:
-                            await safe_edit(uid, query.from_user.username, msg,
-                                            f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
-                            await asyncio.sleep(3)
-                            await show_main_menu(update, context, edit=True)
-                            user_swap_state.pop(uid, None)
-                            return
-
-                        if "nonce" in err_msg:
-                            # 🔄 force resync nonce
-                            try:
-                                fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
-                                await safe_edit(uid, query.from_user.username, msg,
-                                                f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
-                            except Exception as nonce_err:
-                                log_error_to_file(uid, query.from_user.username,
-                                                  f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
-
-                        await safe_edit(
-                            uid, query.from_user.username, msg,
-                            f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s..."
-                        )
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 10)  # tighter cap
-
-            await safe_edit(uid, query.from_user.username, msg,
-                            f"🎉 Completed {success_count}/{count} swaps")
-            if success_count == count:
-                clear_user_errors(uid, query.from_user.username)
-            await asyncio.sleep(3)
-            await show_main_menu(update, context, edit=True)
-            user_swap_state.pop(uid, None)
-
-        asyncio.create_task(task())
+        asyncio.create_task(run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context, update))
 
         return
+
+
+# ------------------- SAVE & LOAD PROGRESS ------------------- #
+def save_progress(uid, wallet, privatekey, token_out, amount, count, current_index):
+    progress = {
+        "uid": uid,
+        "wallet": wallet,
+        "token_out": token_out,
+        "amount": amount,
+        "count": count,
+        "current_index": current_index,
+        "private_key": privatekey
+    }
+    with open(f"progress_{uid}.json", "w") as f:
+        json.dump(progress, f)
+
+
+def load_progress(uid):
+    try:
+        with open(f"progress_{uid}.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+# ------------------- RESUMABLE SWAP LOOP ------------------- #
+async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_index=0, context=None, update=None):
+    success_count = start_index
+    msg = None
+
+    if get_eth_balance(wallet) < (amount * 5):
+        wrap_eth_to_weth(private_key, amount * count)
+    for i in range(start_index, count):
+        retry_delay = 1
+        attempt = 0
+
+        while True:
+            if user_swap_state.get(uid, {}).get("cancel"):
+                if msg:
+                    await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
+                user_swap_state.pop(uid, None)
+                return
+
+            try:
+                fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
+
+                tx_hash = await asyncio.wait_for(
+                    with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
+                    timeout=30
+                )
+
+                if not tx_hash:
+                    raise Exception("Swap failed: no tx hash returned")
+
+                success_count += 1
+
+                if msg:
+                    await safe_edit(uid, None, msg, f"✅ Swap {i + 1}/{count}")
+                else:
+                    msg = await context.bot.send_message(
+                        chat_id=uid,
+                        text=f"✅ Swap {i + 1}/{count}"
+                    )
+
+                # save progress
+                save_progress(uid, wallet, private_key, token_out, amount, count, i)
+                break  # move to next swap
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                log_error_to_file(uid, update.effective_user.username, f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
+                attempt += 1
+
+                err_msg = extract_error_message(e).lower()
+
+                if "insufficient" in err_msg or "not enough balance" in err_msg:
+                    if msg:
+                        await safe_edit(uid, None, msg, f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
+                    user_swap_state.pop(uid, None)
+                    return
+
+                if "nonce" in err_msg:
+                    try:
+                        fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
+                        if msg:
+                            await safe_edit(uid, None, msg, f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
+                    except Exception as nonce_err:
+                        log_error_to_file(uid, None, f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
+
+                if msg:
+                    await safe_edit(uid, None, msg, f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s...")
+
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 10)
+
+    # 🎉 Cleanup after completion
+    try:
+        os.remove(f"progress_{uid}.json")
+    except FileNotFoundError:
+        pass
+
+    if msg:
+        await safe_edit(uid, None, msg, f"🎉 Completed {success_count}/{count} swaps")
+
+    user_swap_state.pop(uid, None)
+    await asyncio.sleep(3)
+    await show_main_menu(update, context, edit=True)
+
+
+# ------------------- AUTO-RESUME ON BOT START ------------------- #
+async def auto_resume_all(context):
+    for file in os.listdir("."):
+        if file.startswith("progress_") and file.endswith(".json"):
+            with open(file, "r") as f:
+                progress = json.load(f)
+
+            uid = progress["uid"]
+            wallet = progress["wallet"]
+            token_out = progress["token_out"]
+            amount = progress["amount"]
+            count = progress["count"]
+            start_index = progress["current_index"] + 1
+            private_key = progress["private_key"]
+
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=(f"⚡ Bot restarted.\n"
+                          f"Auto-resuming swaps {start_index + 1}/{count}...")
+                )
+            except Exception:
+                pass
+
+            asyncio.create_task(
+                run_swaps(uid, wallet, private_key, token_out, amount, count, start_index, context)
+            )
+
+# ================= Shutdown Handlers ================= #
+async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Notify all users that the bot is stopping due to server-side maintenance
+    or background work. Active swap states are preserved for auto-resume.
+    """
+    for file in os.listdir("."):
+        if file.startswith("progress_") and file.endswith(".json"):
+            try:
+                with open(file, "r") as f:
+                    state = json.load(f)
+                uid = state.get("uid")
+                if uid:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            "⚠️ The bot has been stopped due to some background work.\n"
+                            "⏳ Your swaps are paused and will resume automatically when the bot restarts."
+                        )
+                    )
+            except Exception as e:
+                print(f"[WARN] Failed to notify user from {file}: {e}")
+
+def setup_shutdown_handler(application):
+    """
+    Hook into server shutdown to notify users before the bot stops.
+    """
+    def handle_signal(sig, frame):
+        loop = asyncio.get_event_loop()
+        print(f"[INFO] Received shutdown signal ({sig}). Notifying users...")
+        loop.create_task(notify_shutdown(application))
+        loop.create_task(application.stop())  # Stop the bot gracefully
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
 
 # ================= Cancel Handler ================= #
@@ -990,6 +1085,7 @@ def clear_user_errors(uid: int, username: str):
                 continue
             if not skip:
                 f.write(line)
+
 
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
@@ -1114,10 +1210,15 @@ async def set_commands(app):
     ])
 
 
+async def on_startup(app):
+    print("🚀 Bot starting... checking for unfinished swaps...")
+    await auto_resume_all(app.bot)
+
 # ================= Main ================= #
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(TOKEN).post_init(set_commands).build()
+    app = Application.builder().token(TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start_handler))
 
@@ -1146,6 +1247,7 @@ def main():
                                          pattern="^(mywallet|exportkey|balance|deposit|buy|sell|txnbot|help)$"))
 
     logger.info("Bot started. Press Ctrl+C to stop.")
+    setup_shutdown_handler(app)
     app.run_polling()
 
 
