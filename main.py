@@ -855,6 +855,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     # ---------------- MULTIPLE SWAPS ---------------- #
+    # ---------------- MULTIPLE SWAPS ---------------- #
     elif query.data == "confirm_txnbot" and state.get("mode") == "txnbot":
         token_out = state["token_out"]
         amount = state["amount"]  # in ETH
@@ -864,8 +865,6 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_swap_state[uid]["cancel"] = False
 
         # ✅ Pre-check ETH balance before starting
-        if get_eth_balance(wallet) <= (amount * 5):
-            wrap_eth_to_weth(private_key, amount * count)
         try:
             balance = w3.eth.get_balance(wallet) / 1e18
             if balance < amount * count:
@@ -885,7 +884,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         async def task():
             success_count = 0
             for i in range(count):
-                retry_delay = 3
+                retry_delay = 1  # ⏳ faster retry
                 attempt = 0
                 nonetype_failures = 0
 
@@ -893,17 +892,16 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     if user_swap_state.get(uid, {}).get("cancel"):
                         await safe_edit(uid, query.from_user.username, msg,
                                         f"🛑 Swap cancelled at {i + 1}/{count}")
-                        unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
                         user_swap_state.pop(uid, None)
                         return
                     try:
-                        # get pending nonce each time to avoid overlap
+                        # 🔑 always use pending nonce
                         fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
 
-                        # run swap (returns tx hash immediately)
+                        # run swap (returns tx hash immediately after broadcast)
                         tx_hash = await asyncio.wait_for(
                             with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
-                            timeout=60
+                            timeout=30
                         )
 
                         if not tx_hash:
@@ -914,6 +912,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             uid, query.from_user.username, msg,
                             f"✅ Swap {i + 1}/{count}"
                         )
+
+                        # 🚀 go directly to next iteration (no sleep!)
                         break
 
                     except Exception as e:
@@ -932,7 +932,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             return
 
                         if "nonce" in err_msg:
-                            # force resync nonce
+                            # 🔄 force resync nonce
                             try:
                                 fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
                                 await safe_edit(uid, query.from_user.username, msg,
@@ -946,16 +946,13 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s..."
                         )
                         await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 30)
-
-                # small pacing delay to avoid spamming mempool
-                await asyncio.sleep(2)
+                        retry_delay = min(retry_delay * 2, 10)  # tighter cap
 
             await safe_edit(uid, query.from_user.username, msg,
                             f"🎉 Completed {success_count}/{count} swaps")
             if success_count == count:
                 clear_user_errors(uid, query.from_user.username)
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
 
