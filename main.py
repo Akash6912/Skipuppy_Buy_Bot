@@ -1016,18 +1016,32 @@ async def auto_resume_all(context):
             start_index = progress["current_index"] + 1
             private_key = progress["private_key"]
 
+            # Register user swap state
+            user_swap_state[uid] = {
+                "wallet": wallet,
+                "private_key": private_key,
+                "token_out": token_out,
+                "amount": amount,
+                "count": count,
+                "current_index": start_index,
+                "task": None  # placeholder for the asyncio task
+            }
+
+            # Notify user
             try:
                 await context.bot.send_message(
                     chat_id=uid,
                     text=(f"⚡ Bot restarted.\n"
-                          f"Auto-resuming swaps {start_index + 1}/{count}...")
+                          f"Auto-resuming swaps {start_index}/{count}...")
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] Failed to notify {uid}: {e}")
 
-            asyncio.create_task(
+            # Start swaps as a background task and store it
+            task = asyncio.create_task(
                 run_swaps(uid, wallet, private_key, token_out, amount, count, start_index, context)
             )
+            user_swap_state[uid]["task"] = task
 
 
 # ================= Shutdown Handlers ================= #
@@ -1053,6 +1067,7 @@ async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"[WARN] Failed to notify user from {file}: {e}")
 
+
 def setup_shutdown_handler(app: Application):
     loop = asyncio.get_event_loop()
 
@@ -1069,7 +1084,6 @@ def setup_shutdown_handler(app: Application):
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
-
 
 
 # ================= Cancel Handler ================= #
@@ -1112,11 +1126,21 @@ async def safe_edit(uid, q, msg, text):
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid in user_swap_state:
-        user_swap_state[uid]["cancel"] = True
-        await update.message.reply_text("🛑 Swap cancelled by user.")
+
+    state = user_swap_state.get(uid)
+    if not state:
+        await update.message.reply_text("❌ No active swap to cancel.")
+        return
+
+    task = state.get("task")
+    if task and not task.done():
+        task.cancel()  # stop the auto-resume swap
+        await update.message.reply_text("✅ Your swap has been cancelled.")
     else:
-        await update.message.reply_text("⚠️ No active swap to cancel.")
+        await update.message.reply_text("❌ No active swap to cancel.")
+
+    # Remove from swap state
+    user_swap_state.pop(uid, None)
 
 
 # ================= Error Message Handler ================= #
