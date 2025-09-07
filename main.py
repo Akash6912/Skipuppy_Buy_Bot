@@ -912,7 +912,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         success_count += 1
                         await safe_edit(
                             uid, query.from_user.username, msg,
-                            f"✅ Swap {i + 1}/{count} broadcasted!\n🔗 https://basescan.org/tx/{tx_hash}"
+                            f"✅ Swap {i + 1}/{count}"
                         )
                         break
 
@@ -955,7 +955,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             f"🎉 Completed {success_count}/{count} swaps")
             if success_count == count:
                 clear_user_errors(uid, query.from_user.username)
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             await show_main_menu(update, context, edit=True)
             user_swap_state.pop(uid, None)
 
