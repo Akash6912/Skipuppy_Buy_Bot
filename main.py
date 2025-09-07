@@ -1054,23 +1054,21 @@ async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
                 print(f"[WARN] Failed to notify user from {file}: {e}")
 
 
-def setup_shutdown_handler(application):
+def setup_shutdown_handler(application: Application):
     """
-    Hook into server shutdown to notify users before the bot stops.
+    Notify users on server shutdown (Ctrl+C or SIGTERM)
     """
+    loop = asyncio.get_event_loop()
 
-    def handle_signal(sig, frame):
-        print(f"[INFO] Received shutdown signal ({sig}). Notifying users...")
+    def handler(sig, frame):
+        print(f"[INFO] Received shutdown signal ({sig})")
+        # Schedule async shutdown notification
+        loop.create_task(notify_shutdown(application))
+        # Stop the bot gracefully after a short delay to allow messages to send
+        loop.call_later(3, lambda: loop.create_task(application.stop()))
 
-        loop = asyncio.get_running_loop()
-        # Schedule notify_shutdown safely from signal handler
-        asyncio.run_coroutine_threadsafe(notify_shutdown(application), loop)
-
-        # Stop the bot after a short delay to ensure messages are sent
-        loop.call_later(2, lambda: asyncio.run_coroutine_threadsafe(application.stop(), loop))
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
 
 
 # ================= Cancel Handler ================= #
@@ -1262,9 +1260,9 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_button_handler,
                                          pattern="^(mywallet|exportkey|balance|deposit|buy|sell|txnbot|help)$"))
 
-    logger.info("Bot started. Press Ctrl+C to stop.")
     setup_shutdown_handler(app)
-    app.run_polling(close_loop=True, shutdown=setup_shutdown_handler)
+    logger.info("Bot started. Press Ctrl+C to stop.")
+    app.run_polling()
 
 
 if __name__ == "__main__":
