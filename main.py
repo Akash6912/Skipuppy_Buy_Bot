@@ -1002,46 +1002,64 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
 
 # ------------------- AUTO-RESUME ON BOT START ------------------- #
-async def auto_resume_all(context):
+async def auto_resume_all(bot):
+    """
+    Auto-resume swaps from progress files if not canceled.
+    """
+    resumed_any = False
+
     for file in os.listdir("."):
         if file.startswith("progress_") and file.endswith(".json"):
-            with open(file, "r") as f:
-                progress = json.load(f)
-
-            uid = progress["uid"]
-            wallet = progress["wallet"]
-            token_out = progress["token_out"]
-            amount = progress["amount"]
-            count = progress["count"]
-            start_index = progress["current_index"] + 1
-            private_key = progress["private_key"]
-
-            # Register user swap state
-            user_swap_state[uid] = {
-                "wallet": wallet,
-                "private_key": private_key,
-                "token_out": token_out,
-                "amount": amount,
-                "count": count,
-                "current_index": start_index,
-                "task": None  # placeholder for the asyncio task
-            }
-
-            # Notify user
             try:
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=(f"⚡ Bot restarted.\n"
-                          f"Auto-resuming swaps {start_index}/{count}...")
-                )
-            except Exception as e:
-                print(f"[WARN] Failed to notify {uid}: {e}")
+                with open(file, "r") as f:
+                    progress = json.load(f)
 
-            # Start swaps as a background task and store it
-            task = asyncio.create_task(
-                run_swaps(uid, wallet, private_key, token_out, amount, count, start_index, context)
-            )
-            user_swap_state[uid]["task"] = task
+                # Skip canceled swaps
+                if progress.get("canceled"):
+                    continue
+
+                uid = progress["uid"]
+                wallet = progress["wallet"]
+                token_out = progress["token_out"]
+                amount = progress["amount"]
+                count = progress["count"]
+                start_index = progress["current_index"] + 1
+                private_key = progress["private_key"]
+
+                # Register user swap state
+                user_swap_state[uid] = {
+                    "wallet": wallet,
+                    "private_key": private_key,
+                    "token_out": token_out,
+                    "amount": amount,
+                    "count": count,
+                    "current_index": start_index,
+                    "task": None
+                }
+
+                # Notify user
+                try:
+                    await bot.send_message(
+                        chat_id=uid,
+                        text=(f"⚡ Bot restarted.\n"
+                              f"Auto-resuming swaps {start_index}/{count}...")
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to notify {uid}: {e}")
+
+                # Start swaps as a background task
+                task = asyncio.create_task(
+                    run_swaps(uid, wallet, private_key, token_out, amount, count, start_index, bot)
+                )
+                user_swap_state[uid]["task"] = task
+                resumed_any = True
+
+            except Exception as e:
+                print(f"[ERROR] Failed to resume swap from {file}: {e}")
+
+    if not resumed_any:
+        print("[INFO] No active swaps found. Bot restarted without auto-resume.")
+
 
 
 # ================= Shutdown Handlers ================= #
@@ -1127,20 +1145,46 @@ async def safe_edit(uid, q, msg, text):
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
-    state = user_swap_state.get(uid)
-    if not state:
-        await update.message.reply_text("❌ No active swap to cancel.")
+    if uid not in user_swap_state:
+        await update.message.reply_text("⚠️ No active swap to cancel.")
         return
 
-    task = state.get("task")
-    if task and not task.done():
-        task.cancel()  # stop the auto-resume swap
-        await update.message.reply_text("✅ Your swap has been cancelled.")
-    else:
-        await update.message.reply_text("❌ No active swap to cancel.")
+    await cancel_swap(uid, context.bot)
 
-    # Remove from swap state
+
+async def cancel_swap(uid, bot):
+    """
+    Cancel the active swap for a user and prevent auto-resume.
+    """
+    # Stop running swap task
+    if uid in user_swap_state and user_swap_state[uid].get("task"):
+        task = user_swap_state[uid]["task"]
+        task.cancel()
+
+    # Remove in-memory state
     user_swap_state.pop(uid, None)
+
+    # Update progress file to mark as canceled or delete it
+    progress_file = f"progress_{uid}.json"
+    if os.path.exists(progress_file):
+        try:
+            # Option 1: delete file
+            os.remove(progress_file)
+
+            # Option 2: mark as canceled (if you want logs)
+            # with open(progress_file, "r") as f:
+            #     data = json.load(f)
+            # data["canceled"] = True
+            # with open(progress_file, "w") as f:
+            #     json.dump(data, f)
+        except Exception as e:
+            print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
+
+    # Notify user
+    try:
+        await bot.send_message(chat_id=uid, text="❌ Swap canceled successfully. It will not auto-resume.")
+    except Exception:
+        pass
 
 
 # ================= Error Message Handler ================= #
