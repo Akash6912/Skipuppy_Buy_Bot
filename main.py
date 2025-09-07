@@ -1234,8 +1234,7 @@ async def on_startup(app):
 # ================= Main ================= #
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(TOKEN).post_init(set_commands).build()
-    app = Application.builder().token(TOKEN).post_init(on_startup).build()
+    app = Application.builder().token(TOKEN).post_init(set_commands).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start_handler))
 
@@ -1265,7 +1264,7 @@ def main():
 
     logger.info("Bot started. Press Ctrl+C to stop.")
     setup_shutdown_handler(app)
-    app.run_polling()
+    app.run_polling(close_loop=True, shutdown=setup_shutdown_handler)
 
 
 if __name__ == "__main__":
