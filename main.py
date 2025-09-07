@@ -647,28 +647,28 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
 
 # --- Async Wrapper with Retries + Failover --- #
 async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
+    """Send swap txn and return tx hash immediately after broadcast (no confirmation wait)."""
     loop = asyncio.get_running_loop()
-    delay = 5  # initial retry delay (seconds)
-
-    # rotate through RPCs on retries
+    delay = 5  # initial retry delay
     for attempt in range(1, max_retries + 1):
         rpc_url = RPC_LIST[(attempt - 1) % len(RPC_LIST)]
-
         try:
-            # Run the blocking trade in executor, with timeout
+            # Run the blocking sync call in executor
             tx_hash = await asyncio.wait_for(
                 loop.run_in_executor(
                     executor,
-                    do_buy_sync,
+                    do_buy_sync,  # <- must be updated to only send & return hash
                     wallet, private_key, token_out, amount, rpc_url
                 ),
-                timeout=90  # ⏳ 90s timeout per trade
+                timeout=30  # shorter timeout since we're not waiting for confirmation
             )
-            return f"✅ Swap successful!\n🔗 https://basescan.org/tx/0x{tx_hash}"
+            if not tx_hash:
+                raise Exception("No tx hash returned")
+            return tx_hash  # ✅ return raw tx hash immediately
 
         except asyncio.TimeoutError:
             if attempt == max_retries:
-                raise Exception(f"Swap timed out after {max_retries} attempts (last RPC: {rpc_url})")
+                raise Exception(f"Swap timed out after {max_retries} attempts (last RPC={rpc_url})")
             print(f"[WARN] Swap timed out (attempt {attempt}, RPC={rpc_url}), retrying in {delay}s...")
 
         except Exception as e:
@@ -676,9 +676,9 @@ async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
                 raise
             print(f"[WARN] Swap failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
 
-        # Exponential backoff with jitter
-        await asyncio.sleep(delay + random.uniform(0, 3))
-        delay = min(delay * 2, 60)  # cap at 60s
+        # exponential backoff with jitter
+        await asyncio.sleep(delay + random.uniform(0, 2))
+        delay = min(delay * 2, 60)
 
 async def with_user_lock(uid, coro):
     """Ensure one user's swaps run sequentially, but allow concurrency across users."""
@@ -863,14 +863,14 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # set cancel flag
         user_swap_state[uid]["cancel"] = False
 
-        # ✅ Pre-check balance before starting
+        # ✅ Pre-check ETH balance before starting
         if get_eth_balance(wallet) <= (amount * 5):
-            tx = wrap_eth_to_weth(private_key, amount * (count/2))
+            wrap_eth_to_weth(private_key, amount * count)
         try:
-            balance = w3.eth.get_balance(wallet) / 1e18  # ETH balance
+            balance = w3.eth.get_balance(wallet) / 1e18
             if balance < amount * count:
                 await query.edit_message_text(
-                    f"❌ Insufficient balance.\n\nYou need at least {amount * count:.6f} ETH "
+                    f"❌ Insufficient balance.\n\nNeed {amount * count:.6f} ETH "
                     f"for {count} swaps, but only have {balance:.6f} ETH."
                 )
                 return
@@ -884,86 +884,75 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         async def task():
             success_count = 0
-
             for i in range(count):
-                retry_delay = 5
+                retry_delay = 3
                 attempt = 0
                 nonetype_failures = 0
 
                 while True:
-                    # 🛑 Check cancel flag
                     if user_swap_state.get(uid, {}).get("cancel"):
                         await safe_edit(uid, query.from_user.username, msg,
                                         f"🛑 Swap cancelled at {i + 1}/{count}")
+                        unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
                         user_swap_state.pop(uid, None)
                         return
-
                     try:
-                        # Run swap with timeout
-                        result = await asyncio.wait_for(
+                        # get pending nonce each time to avoid overlap
+                        fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
+
+                        # run swap (returns tx hash immediately)
+                        tx_hash = await asyncio.wait_for(
                             with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
-                            timeout=120
+                            timeout=60
                         )
 
-                        if not result:
+                        if not tx_hash:
                             raise Exception("Swap failed: no tx hash returned")
 
                         success_count += 1
-                        await safe_edit(uid, query.from_user.username, msg, f"✅ Swap {i + 1}/{count} done")
+                        await safe_edit(
+                            uid, query.from_user.username, msg,
+                            f"✅ Swap {i + 1}/{count} broadcasted!\n🔗 https://basescan.org/tx/{tx_hash}"
+                        )
                         break
 
                     except Exception as e:
                         tb = traceback.format_exc()
-                        log_error_to_file(uid, query.from_user.username, f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
+                        log_error_to_file(uid, query.from_user.username,
+                                          f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
                         err_msg = extract_error_message(e).lower()
                         attempt += 1
 
                         if "insufficient" in err_msg or "not enough balance" in err_msg:
-                            await safe_edit(
-                                uid, query.from_user.username,
-                                msg,
-                                f"❌ Swap {i + 1} failed: {err_msg}\n\n💡 Stopping bot (insufficient balance)."
-                            )
+                            await safe_edit(uid, query.from_user.username, msg,
+                                            f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
                             await asyncio.sleep(3)
                             await show_main_menu(update, context, edit=True)
                             user_swap_state.pop(uid, None)
                             return
 
-                        if "nonetype" in err_msg and "hex" in err_msg:
-                            nonetype_failures += 1
-                            await safe_edit(
-                                uid, query.from_user.username,
-                                msg,
-                                f"⚠️ Swap {i + 1} failed: missing tx hash (attempt {attempt}), retrying in {retry_delay}s..."
-                            )
-                            if nonetype_failures >= 3:
-                                try:
-                                    fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
-                                    await safe_edit(
-                                        uid, query.from_user.username,
-                                        msg,
-                                        f"🔄 Resynced nonce to {fresh_nonce} for wallet.\nRetrying swap {i + 1}..."
-                                    )
-                                    nonetype_failures = 0
-                                except Exception as nonce_err:
-                                    log_error_to_file(uid, query.from_user.username,
-                                                      f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
-                                    await safe_edit(uid, query.from_user.username, msg,
-                                                    f"⚠️ Failed to resync nonce: {str(nonce_err)}")
-                        else:
-                            await safe_edit(
-                                uid, query.from_user.username,
-                                msg,
-                                f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s..."
-                            )
+                        if "nonce" in err_msg:
+                            # force resync nonce
+                            try:
+                                fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
+                                await safe_edit(uid, query.from_user.username, msg,
+                                                f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
+                            except Exception as nonce_err:
+                                log_error_to_file(uid, query.from_user.username,
+                                                  f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
 
+                        await safe_edit(
+                            uid, query.from_user.username, msg,
+                            f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s..."
+                        )
                         await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 60)
+                        retry_delay = min(retry_delay * 2, 30)
 
-                await asyncio.sleep(5)
+                # small pacing delay to avoid spamming mempool
+                await asyncio.sleep(2)
 
-            await safe_edit(uid, query.from_user.username, msg, f"🎉 Completed {success_count}/{count} swaps")
-            # ✅ Clean up user's past errors if all swaps finished
+            await safe_edit(uid, query.from_user.username, msg,
+                            f"🎉 Completed {success_count}/{count} swaps")
             if success_count == count:
                 clear_user_errors(uid, query.from_user.username)
             await asyncio.sleep(3)
