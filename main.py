@@ -965,16 +965,6 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ================= Cancel Handler ================= #
-def git_commit_and_push(file_path: str, message: str = "Update swap_errors.txt"):
-    """Commit and push changes to GitHub."""
-    try:
-        subprocess.run(["git", "add", file_path], cwd=GIT_REPO_PATH, check=True)
-        subprocess.run(["git", "commit", "-m", message], cwd=GIT_REPO_PATH, check=True)
-        subprocess.run(["git", "push"], cwd=GIT_REPO_PATH, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[⚠️ Git Push Failed] {str(e)}")
-
-
 def log_error_to_file(uid: int, username: str, msg: str):
     """Append errors to a log file with user details + timestamp."""
     file_path = os.path.join(GIT_REPO_PATH, ERROR_LOG_FILE)
@@ -983,7 +973,6 @@ def log_error_to_file(uid: int, username: str, msg: str):
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
             f"User: {username or 'N/A'} (ID: {uid})\n{msg}\n\n"
         )
-    git_commit_and_push(file_path, f"Log error for user {username or uid}")
 
 
 def clear_user_errors(uid: int, username: str):
@@ -1003,7 +992,6 @@ def clear_user_errors(uid: int, username: str):
                 continue
             if not skip:
                 f.write(line)
-    git_commit_and_push(file_path, f"Clear errors for user {username or uid}")
 
 async def safe_edit(uid, q, msg, text):
     """Safe wrapper for Telegram message edits."""
