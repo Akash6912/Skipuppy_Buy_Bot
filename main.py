@@ -855,7 +855,6 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     # ---------------- MULTIPLE SWAPS ---------------- #
-    # ---------------- MULTIPLE SWAPS ---------------- #
     elif query.data == "confirm_txnbot" and state.get("mode") == "txnbot":
         token_out = state["token_out"]
         amount = state["amount"]  # in ETH
@@ -878,6 +877,8 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("⚠️ Could not fetch balance, aborting swaps.")
             return
 
+        if get_eth_balance(wallet) <= (amount * 5):
+            wrap_eth_to_weth(private_key, amount * count)
         await query.edit_message_text(f"⏳ Starting {count} swaps...")
         msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
 
