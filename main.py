@@ -33,7 +33,6 @@ load_dotenv(override=True)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ERROR_LOG_FILE = "swap_errors.txt"
-GIT_REPO_PATH = os.environ.get("GITHUB_PATH")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -622,8 +621,8 @@ RPC_LIST = [
 def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     """Synchronous logic that performs one buy trade using a given RPC"""
     # Wrap ETH to WETH if balance too low
-    if get_eth_balance(wallet) <= (amount * 5):
-        wrap_eth_to_weth(private_key, amount * 5)
+    if get_eth_balance(wallet) <= (amount * 10):
+        wrap_eth_to_weth(private_key, amount * 10)
 
     uniswap = Uniswap(
         wallet_address=wallet,
@@ -912,9 +911,8 @@ def load_progress(uid):
 async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_index=0, context=None):
     success_count = start_index
     msg = None
-    balance = get_eth_balance(wallet)
 
-    if get_eth_balance(wallet) < (amount * 5):
+    if get_eth_balance(wallet) <= (amount * 10):
         wrap_eth_to_weth(private_key, amount * count)
     for i in range(start_index, count):
         retry_delay = 1
@@ -924,8 +922,8 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
             if user_swap_state.get(uid, {}).get("cancel"):
                 if msg:
                     await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
-                if balance > 0:
-                    unwrap_weth_to_eth(private_key, balance)
+                if get_eth_balance(wallet) > 0:
+                    unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
                 user_swap_state.pop(uid, None)
                 return
 
@@ -996,8 +994,8 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(3)
-    if balance > 0:
-        unwrap_weth_to_eth(private_key, balance)
+    if get_eth_balance(wallet) > 0:
+        unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
     await show_main_menu(None, context, edit=True)
 
 
@@ -1107,7 +1105,6 @@ def setup_shutdown_handler(app: Application):
 # ================= Cancel Handler ================= #
 def log_error_to_file(uid: int, username: str, msg: str):
     """Append errors to a log file with user details + timestamp."""
-    file_path = os.path.join(GIT_REPO_PATH, ERROR_LOG_FILE)
     with open(ERROR_LOG_FILE, "a") as f:
         f.write(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
@@ -1117,7 +1114,6 @@ def log_error_to_file(uid: int, username: str, msg: str):
 
 def clear_user_errors(uid: int, username: str):
     """Remove all error logs related to a specific user from the file."""
-    file_path = os.path.join(GIT_REPO_PATH, ERROR_LOG_FILE)
     if not os.path.exists(ERROR_LOG_FILE):
         return
     with open(ERROR_LOG_FILE, "r") as f:
