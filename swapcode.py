@@ -464,8 +464,9 @@ class Uniswap:
             has_sufficient_balance = balance >= total_gas_wei
             if not has_sufficient_balance:
                 needed_eth = Web3.from_wei(total_gas_wei - balance, "ether")
-                raise(f"⚠️ ERROR: Insufficient balance!")
                 print(f"⚠️ Need {needed_eth} more ETH")
+                raise(f"⚠️ ERROR: Insufficient balance!")
+
 
             return {
                 'max_fee_per_gas': int(new_max_fee_per_gas),  # Ensure integer

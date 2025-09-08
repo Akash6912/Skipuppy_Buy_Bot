@@ -38,11 +38,26 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message
 logger = logging.getLogger(__name__)
 
 # --- Web3 Setup (Base Chain) ---
-BASE_RPC = os.getenv("BASE_RPC", os.environ.get("BASE_RPC"))
-w3 = Web3(Web3.HTTPProvider(BASE_RPC))
+# List of available Base RPC endpoints
+RPC_ENDPOINTS = [
+    os.environ.get("BASE_RPC"),
+    os.environ.get("BASE_RPC1")
+]
+
+# Keep web3 instances per endpoint
+W3_POOL = [Web3(Web3.HTTPProvider(rpc)) for rpc in RPC_ENDPOINTS]
 
 # Reuse a thread pool for blocking web3 calls
 executor = ThreadPoolExecutor(max_workers=30)
+
+
+def get_user_w3(uid: int) -> Web3:
+    """
+    Assign an RPC provider to the user based on uid.
+    If more users than RPCs, reuse them round-robin.
+    """
+    index = uid % len(W3_POOL)
+    return W3_POOL[index]
 
 
 # --- DB setup ---
@@ -204,7 +219,7 @@ async def fetch_metadata(session, contract_address):
         "method": "alchemy_getTokenMetadata",
         "params": [contract_address]
     }
-    async with session.post(BASE_RPC, json=meta_payload) as resp:
+    async with session.post(os.environ.get("BASE_RPC"), json=meta_payload) as resp:
         try:
             data = await resp.json()
             return contract_address, data.get("result", {})
@@ -215,7 +230,7 @@ async def fetch_metadata(session, contract_address):
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     row = get_wallet_row(tid)
-
+    w3 = get_user_w3(tid)
     if not row:
         await context.bot.send_message(chat_id=update.effective_chat.id,
                                        text="⚠️ No wallet found. Use /start to create one.")
@@ -232,7 +247,7 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(BASE_RPC, json=payload) as resp:
+        async with session.post(os.environ.get("BASE_RPC"), json=payload) as resp:
             try:
                 data = await resp.json()
             except Exception:
@@ -375,6 +390,7 @@ async def withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     row = get_wallet_row(tid)  # (tid, wallet_address, encrypted_privkey)
     BOT_ADDRESS = row[1]
+    w3 = get_user_w3(tid)
 
     try:
         amount = float(update.message.text.strip())
@@ -461,13 +477,13 @@ WETH_ABI = [
     }
 ]
 
-weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
 
-
-def wrap_eth_to_weth(private_key: str, amount_eth: float):
+def wrap_eth_to_weth(private_key: str, amount_eth: float, w3):
     """Wrap ETH into WETH on Base chain."""
     account = Account.from_key(private_key)
     address = account.address
+
+    weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
 
     # Build tx for deposit()
     txn = weth_contract.functions.deposit().build_transaction({
@@ -485,10 +501,12 @@ def wrap_eth_to_weth(private_key: str, amount_eth: float):
     return w3.to_hex(tx_hash)
 
 
-def unwrap_weth_to_eth(private_key: str, amount_eth: float):
+def unwrap_weth_to_eth(private_key: str, amount_eth: float, w3):
     """Unwrap WETH into ETH on Base chain."""
     account = Account.from_key(private_key)
     address = account.address
+
+    weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
 
     txn = weth_contract.functions.withdraw(
         w3.to_wei(amount_eth, "ether")
@@ -610,30 +628,25 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("⚠️ Invalid number. Enter an integer.")
 
 
-# List of RPCs for failover
-RPC_LIST = [
-    os.environ.get("BASE_RPC"),  # your primary
-    "https://mainnet.base.org",  # backup 2
-]
-
-
 # --- Sync Buy Logic --- #
-def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
+def do_buy_sync(uid, wallet, private_key, token_out, amount, rpc_url):
     """Synchronous logic that performs one buy trade using a given RPC"""
-    # Wrap ETH to WETH if balance too low
-    if get_eth_balance(wallet) <= (amount * 10):
-        wrap_eth_to_weth(private_key, amount * 10)
+    w3 = W3_POOL[rpc_url]
+
+    # ✅ Optional: Wrap ETH into WETH if balance low
+    if get_eth_balance(wallet, w3) <= (amount * 10):
+        wrap_eth_to_weth(private_key, amount * 10, w3)
 
     uniswap = Uniswap(
         wallet_address=wallet,
         private_key=private_key,
-        provider=rpc_url,
+        provider=rpc_url,  # must pass correct RPC url
         web3=w3
     )
 
     value = w3.to_wei(amount, "ether")
 
-    # Normal trade (Uniswap will manage nonce internally)
+    # ✅ Normal trade (Uniswap manages nonce internally)
     tx_hash = uniswap.make_trade(
         from_token="0x4200000000000000000000000000000000000006",  # WETH on Base
         to_token=token_out,
@@ -645,20 +658,29 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     return tx_hash.hex()
 
 
-# --- Async Wrapper with Retries + Failover --- #
-async def perform_buy(wallet, private_key, token_out, amount, max_retries=3):
-    """Send swap txn and return tx hash immediately after broadcast (no confirmation wait)."""
+# --- Async Wrapper with Retries + Failover ---
+async def perform_buy(uid, wallet, private_key, token_out, amount, max_retries=3):
+    """
+    Send swap txn and return tx hash immediately after broadcast (no confirmation wait).
+    Assigns RPC per user, with retry/fallback across the pool.
+    """
     loop = asyncio.get_running_loop()
     delay = 5  # initial retry delay
+
+    # Start with user-assigned RPC
+    base_index = uid % len(RPC_ENDPOINTS)
+
     for attempt in range(1, max_retries + 1):
-        rpc_url = RPC_LIST[(attempt - 1) % len(RPC_LIST)]
+        rpc_index = (base_index + attempt - 1) % len(RPC_ENDPOINTS)
+        rpc_url = RPC_ENDPOINTS[rpc_index]
+
         try:
             # Run the blocking sync call in executor
             tx_hash = await asyncio.wait_for(
                 loop.run_in_executor(
                     executor,
-                    do_buy_sync,  # <- must be updated to only send & return hash
-                    wallet, private_key, token_out, amount, rpc_url
+                    do_buy_sync,
+                    uid, wallet, private_key, token_out, amount, rpc_url
                 ),
                 timeout=30  # shorter timeout since we're not waiting for confirmation
             )
@@ -690,7 +712,7 @@ async def with_user_lock(uid, coro):
 
 
 # ================= Sell Handler ================= #
-def get_eth_balance(address):
+def get_eth_balance(address, w3):
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json"
@@ -736,36 +758,80 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_swap_state[update.effective_user.id] = {"step": "token_in", "mode": "sell"}
 
 
-async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05):
-    def sync_sell():
-        uniswap = Uniswap(
-            wallet_address=wallet,
-            private_key=private_key,
-            provider=os.environ.get("BASE_RPC"),
-            web3=w3
+# --- Sync Sell with specific RPC ---
+def do_sell_sync(wallet, private_key, token_in, amount, slippage, rpc_url):
+    """Synchronous logic that performs one sell trade using a given RPC"""
+    w3 = W3_POOL[rpc_url]
+
+    uniswap = Uniswap(
+        wallet_address=wallet,
+        private_key=private_key,
+        provider=rpc_url,
+        web3=w3
+    )
+
+    value = w3.to_wei(amount, "ether")  # adjust decimals if token_in != 18 decimals
+
+    try:
+        tx_hash = uniswap.make_trade(
+            from_token=token_in,
+            to_token="0x4200000000000000000000000000000000000006",  # WETH
+            amount=value,
+            fee=10000,
+            slippage=int(slippage * 100),  # Uniswap lib expects int basis points
+            pool_version="v3",
         )
 
-        value = w3.to_wei(amount, "ether")  # adjust decimals if needed
+        # ✅ optional: unwrap WETH -> ETH if balance > 0
+        weth_balance = get_eth_balance(wallet, w3)
+        if weth_balance > 0:
+            unwrap_weth_to_eth(private_key, weth_balance, w3)
+
+        return tx_hash.hex()
+
+    except Exception as e:
+        raise Exception(f"Sell failed: {e}")
+
+
+# --- Async Wrapper for Sell with retries ---
+async def perform_sell(uid, wallet, private_key, token_in, amount, slippage=0.05, max_retries=3):
+    """
+    Send sell txn and return tx hash immediately after broadcast.
+    Uses user-assigned RPC with retry/fallback across pool.
+    """
+    loop = asyncio.get_running_loop()
+    delay = 5  # initial retry delay
+
+    # Start with user-assigned RPC
+    base_index = uid % len(RPC_ENDPOINTS)
+
+    for attempt in range(1, max_retries + 1):
+        rpc_index = (base_index + attempt - 1) % len(RPC_ENDPOINTS)
+        rpc_url = RPC_ENDPOINTS[rpc_index]
 
         try:
-            tx_hash = uniswap.make_trade(
-                from_token=token_in,
-                to_token="0x4200000000000000000000000000000000000006",  # WETH
-                amount=value,
-                fee=10000,
-                slippage=int(slippage * 100),
-                pool_version="v3",
+            tx_hash = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executor,
+                    do_sell_sync,
+                    uid, wallet, private_key, token_in, amount, slippage, rpc_url
+                ),
+                timeout=30
             )
+            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash}"
 
-            if get_eth_balance(wallet) > 0:
-                unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
+        except asyncio.TimeoutError:
+            if attempt == max_retries:
+                raise Exception(f"Sell timed out after {max_retries} attempts (last RPC={rpc_url})")
+            print(f"[WARN] Sell timed out (attempt {attempt}, RPC={rpc_url}), retrying in {delay}s...")
 
-            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
         except Exception as e:
-            return f"⚠️ Sell failed: {str(e)}"
+            if attempt == max_retries:
+                raise
+            print(f"[WARN] Sell failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
 
-    # Run blocking sell in thread, async safe
-    return await asyncio.to_thread(sync_sell)
+        await asyncio.sleep(delay + random.uniform(0, 2))
+        delay = min(delay * 2, 60)
 
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -794,7 +860,7 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("⏳ Selling token...")
 
         # Non-blocking sell
-        result_msg = await perform_sell(wallet, private_key, token_in, amount)
+        result_msg = await perform_sell(uid, wallet, private_key, token_in, amount)
         await context.bot.send_message(chat_id=query.message.chat_id, text=result_msg)
 
         # Show main menu
@@ -817,6 +883,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     tid = uid
 
     row = get_wallet_row(tid)
+    w3 = get_user_w3(uid)
     if uid not in user_swap_state:
         return
 
@@ -841,7 +908,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         async def task():
             try:
                 # Lock ensures no overlapping swaps for SAME user
-                result = await with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount))
+                result = await with_user_lock(uid, perform_buy(uid, wallet, private_key, token_out, amount))
                 await context.bot.send_message(chat_id=query.message.chat_id, text=result)
             except Exception as e:
                 err_msg = extract_error_message(e)
@@ -912,8 +979,9 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
     success_count = start_index
     msg = None
 
-    if get_eth_balance(wallet) <= (amount * 10):
-        wrap_eth_to_weth(private_key, amount * count)
+    w3 = get_user_w3(uid)
+    if get_eth_balance(wallet, w3) <= (amount * 10):
+        wrap_eth_to_weth(private_key, amount * count, w3)
     for i in range(start_index, count):
         retry_delay = 1
         attempt = 0
@@ -922,8 +990,8 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
             if user_swap_state.get(uid, {}).get("cancel"):
                 if msg:
                     await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
-                if get_eth_balance(wallet) > 0:
-                    unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
+                if get_eth_balance(wallet, w3) > 0:
+                    unwrap_weth_to_eth(private_key, get_eth_balance(wallet, w3), w3)
                 user_swap_state.pop(uid, None)
                 return
 
@@ -931,7 +999,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                 fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
 
                 tx_hash = await asyncio.wait_for(
-                    with_user_lock(uid, perform_buy(wallet, private_key, token_out, amount)),
+                    with_user_lock(uid, perform_buy(uid, wallet, private_key, token_out, amount)),
                     timeout=30
                 )
 
@@ -994,8 +1062,8 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(3)
-    if get_eth_balance(wallet) > 0:
-        unwrap_weth_to_eth(private_key, get_eth_balance(wallet))
+    if get_eth_balance(wallet, w3) > 0:
+        unwrap_weth_to_eth(private_key, get_eth_balance(wallet, w3), w3)
     await show_main_menu(None, context, edit=True)
 
 
@@ -1057,7 +1125,6 @@ async def auto_resume_all(bot):
 
     if not resumed_any:
         print("[INFO] No active swaps found. Bot restarted without auto-resume.")
-
 
 
 # ================= Shutdown Handlers ================= #
