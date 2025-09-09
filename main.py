@@ -458,62 +458,75 @@ withdraw_handler = ConversationHandler(
 
 
 # ================= Wrap/Unwrap eth Handlers ================= #
-# --- Wrap ETH to WETH ---
-def wrap_eth_to_weth(private_key: str, amount_eth: float, w3: Web3):
-    """Wrap ETH into WETH using deposit() with given RPC."""
+# WETH contract address on Base
+WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
+WETH_ABI = [
+    {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable", "type": "function"},
+    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [], "payable": False, "stateMutability": "nonpayable", "type": "function"},
+]
 
-    account = Account.from_key(private_key)
-    address = account.address
 
-    weth_contract = w3.eth.contract(
-        address=Web3.to_checksum_address("0x4200000000000000000000000000000000000006"),  # WETH on Base
-        abi=[{"inputs": [], "name": "deposit", "outputs": [], "stateMutability": "payable", "type": "function"}]
-    )
-
+def wrap_eth_to_weth(private_key: str, amount_eth: float, w3: Web3) -> str:
+    """Wrap ETH into WETH safely (with pending nonce + gas bump)."""
     try:
-        txn = weth_contract.functions.deposit().build_transaction({
+        account = Account.from_key(private_key)
+        address = account.address
+
+        weth = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
+
+        # Always fetch latest pending nonce
+        nonce = w3.eth.get_transaction_count(address, "pending")
+
+        # Gas bump (10%)
+        gas_price = int(w3.eth.gas_price * 1.1)
+
+        tx = weth.functions.deposit().build_transaction({
             "from": address,
+            "nonce": nonce,
             "value": w3.to_wei(amount_eth, "ether"),
-            "nonce": w3.eth.get_transaction_count(address),
             "gas": 100000,
-            "gasPrice": w3.eth.gas_price,
+            "gasPrice": gas_price,
         })
 
-        signed_txn = w3.eth.account.sign_transaction(txn, private_key=private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
         return tx_hash.hex()
+
     except Exception as e:
         print(f"[ERROR] WETH wrap failed: {e}")
-        return None
+        raise
 
 
-# --- Unwrap WETH to ETH ---
-def unwrap_weth_to_eth(private_key: str, amount_eth: float, w3: Web3):
-    """Unwrap WETH into ETH using withdraw() with given RPC."""
-
-    account = Account.from_key(private_key)
-    address = account.address
-
-    weth_contract = w3.eth.contract(
-        address=Web3.to_checksum_address("0x4200000000000000000000000000000000000006"),  # WETH on Base
-        abi=[{"inputs": [{"internalType": "uint256", "name": "wad", "type": "uint256"}],
-              "name": "withdraw", "outputs": [], "stateMutability": "nonpayable", "type": "function"}]
-    )
-
+def unwrap_weth_to_eth(private_key: str, amount_wei: int, w3: Web3) -> str:
+    """Unwrap WETH back into ETH safely (with pending nonce + gas bump)."""
     try:
-        txn = weth_contract.functions.withdraw(w3.to_wei(amount_eth, "ether")).build_transaction({
+        account = Account.from_key(private_key)
+        address = account.address
+
+        weth = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
+
+        # Always fetch latest pending nonce
+        nonce = w3.eth.get_transaction_count(address, "pending")
+
+        # Gas bump (10%)
+        gas_price = int(w3.eth.gas_price * 1.1)
+
+        tx = weth.functions.withdraw(amount_wei).build_transaction({
             "from": address,
-            "nonce": w3.eth.get_transaction_count(address),
+            "nonce": nonce,
             "gas": 100000,
-            "gasPrice": w3.eth.gas_price,
+            "gasPrice": gas_price,
         })
 
-        signed_txn = w3.eth.account.sign_transaction(txn, private_key=private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
         return tx_hash.hex()
+
     except Exception as e:
         print(f"[ERROR] WETH unwrap failed: {e}")
-        return None
+        raise
 
 
 # --- Buy Handlers ---
