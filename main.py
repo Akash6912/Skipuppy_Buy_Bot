@@ -789,7 +789,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05, max
                 if weth_balance > 0:
                     unwrap_weth_to_eth(private_key, weth_balance, w3)
 
-                return f"✅ Sell successful!\n🔗 https://basescan.org/tx/{tx_hash.hex()}"
+                return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
 
             except Exception as e:
                 return f"⚠️ Sell failed: {str(e)}"
@@ -843,7 +843,7 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("⏳ Selling token...")
 
         # Non-blocking sell
-        result_msg = await perform_sell(uid, wallet, private_key, token_in, amount)
+        result_msg = await perform_sell(wallet, private_key, token_in, amount)
         await context.bot.send_message(chat_id=query.message.chat_id, text=result_msg)
 
         # Show main menu
