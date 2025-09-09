@@ -47,9 +47,9 @@ RPC_ENDPOINTS = [
 # Keep web3 instances per endpoint
 W3_POOL = [Web3(Web3.HTTPProvider(rpc)) for rpc in RPC_ENDPOINTS]
 
+
 # Reuse a thread pool for blocking web3 calls
 executor = ThreadPoolExecutor(max_workers=30)
-
 
 def get_user_w3(uid: int) -> Web3:
     """
@@ -834,6 +834,7 @@ async def perform_sell(uid, wallet, private_key, token_in, amount, slippage=0.05
         delay = min(delay * 2, 60)
 
 
+
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1127,6 +1128,7 @@ async def auto_resume_all(bot):
         print("[INFO] No active swaps found. Bot restarted without auto-resume.")
 
 
+
 # ================= Shutdown Handlers ================= #
 async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1219,31 +1221,27 @@ async def cancel_swap(uid, bot):
     """
     Cancel the active swap for a user and prevent auto-resume.
     """
-    # Stop running swap task
-    if uid in user_swap_state and user_swap_state[uid].get("task"):
-        task = user_swap_state[uid]["task"]
-        task.cancel()
+    if uid in user_swap_state:
+        # set cancel flag
+        user_swap_state[uid]["cancel"] = True
 
-    # Remove in-memory state
-    user_swap_state.pop(uid, None)
+        # cancel background task if directly referenced
+        if user_swap_state[uid].get("task"):
+            task = user_swap_state[uid]["task"]
+            task.cancel()
 
-    # Update progress file to mark as canceled or delete it
-    progress_file = f"progress_{uid}.json"
-    if os.path.exists(progress_file):
-        try:
-            # Option 1: delete file
-            os.remove(progress_file)
+        # remove progress file
+        progress_file = f"progress_{uid}.json"
+        if os.path.exists(progress_file):
+            try:
+                os.remove(progress_file)
+            except Exception as e:
+                print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
 
-            # Option 2: mark as canceled (if you want logs)
-            # with open(progress_file, "r") as f:
-            #     data = json.load(f)
-            # data["canceled"] = True
-            # with open(progress_file, "w") as f:
-            #     json.dump(data, f)
-        except Exception as e:
-            print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
+        # do not pop here yet → let loop clean itself gracefully
+        # user_swap_state.pop(uid, None)
 
-    # Notify user
+    # notify user
     try:
         await bot.send_message(chat_id=uid, text="❌ Swap canceled successfully. It will not auto-resume.")
     except Exception:
