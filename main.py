@@ -636,8 +636,26 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # --- Sync Buy Logic --- #
+user_rpc_map = {}  # sticky RPC assignment per user
+next_rpc_index = 0  # round-robin pointer
+
+
+def assign_rpc(uid: int) -> str:
+    """
+    Assign an RPC to a user in round-robin fashion.
+    Each user sticks to the same RPC until restart.
+    """
+    global next_rpc_index
+    if uid not in user_rpc_map:
+        rpc_url = RPC_ENDPOINTS[next_rpc_index]
+        user_rpc_map[uid] = rpc_url
+        next_rpc_index = (next_rpc_index + 1) % len(RPC_ENDPOINTS)
+    return user_rpc_map[uid]
+
+
+# --- Core Buy Logic (Sync) ---
 def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
-    """Synchronous logic that performs one buy trade using a given RPC"""
+    """Synchronous logic that performs one buy trade using a given RPC."""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
 
     # Wrap ETH if too low
@@ -654,7 +672,7 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     value = w3.to_wei(amount, "ether")
 
     tx_hash = uniswap.make_trade(
-        from_token="0x4200000000000000000000000000000000000006",  # WETH
+        from_token="0x4200000000000000000000000000000000000006",  # WETH on Base
         to_token=token_out,
         amount=value,
         fee=10000,
@@ -668,27 +686,25 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
 async def perform_buy(uid, wallet, private_key, token_out, amount, max_retries=3):
     """
     Send swap txn and return tx hash immediately after broadcast (no confirmation wait).
-    Assigns RPC per user, with retry/fallback across the pool.
+    Uses per-user round-robin RPC assignment with retry/fallback.
     """
     loop = asyncio.get_running_loop()
-    delay = 5  # initial retry delay
+    delay = 5
 
-    # Start with user-assigned RPC
-    base_index = hash(uid) % len(RPC_ENDPOINTS)
+    # sticky RPC for this user
+    base_rpc = assign_rpc(uid)
+    base_index = RPC_ENDPOINTS.index(base_rpc)
 
     for attempt in range(1, max_retries + 1):
-        rpc_index = (base_index + attempt - 1) % len(RPC_ENDPOINTS)
-        rpc_url = RPC_ENDPOINTS[rpc_index]
-
+        rpc_url = RPC_ENDPOINTS[(base_index + attempt - 1) % len(RPC_ENDPOINTS)]
         try:
-            # Run the blocking sync call in executor
             tx_hash = await asyncio.wait_for(
                 loop.run_in_executor(
                     executor,
                     do_buy_sync,
                     wallet, private_key, token_out, amount, rpc_url
                 ),
-                timeout=30  # shorter timeout since we're not waiting for confirmation
+                timeout=30
             )
             if not tx_hash:
                 raise Exception("No tx hash returned")
@@ -704,7 +720,6 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, max_retries=3
                 raise
             print(f"[WARN] Swap failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
 
-        # exponential backoff with jitter
         await asyncio.sleep(delay + random.uniform(0, 2))
         delay = min(delay * 2, 60)
 
