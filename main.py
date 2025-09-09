@@ -906,7 +906,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             try:
                 # Lock ensures no overlapping swaps for SAME user
                 result = await with_user_lock(uid, perform_buy(uid, wallet, private_key, token_out, amount))
-                await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ Buy successful!\n🔗 https://basescan.org/tx/0x{result.hex()}")
+                await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ Buy successful!\n🔗 https://basescan.org/tx/0x{result}")
             except Exception as e:
                 err_msg = extract_error_message(e)
                 await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {err_msg}")
