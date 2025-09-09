@@ -457,70 +457,62 @@ withdraw_handler = ConversationHandler(
 )
 
 # ================= Wrap/Unwrap eth Handlers ================= #
-WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
-WETH_ABI = [
-    {
-        "inputs": [],
-        "name": "deposit",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [
-            {"internalType": "uint256", "name": "wad", "type": "uint256"}
-        ],
-        "name": "withdraw",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    }
-]
+# --- Wrap ETH to WETH ---
+def wrap_eth_to_weth(private_key: str, amount_eth: float, w3: Web3):
+    """Wrap ETH into WETH using deposit() with given RPC."""
 
-
-def wrap_eth_to_weth(private_key: str, amount_eth: float, w3):
-    """Wrap ETH into WETH on Base chain."""
     account = Account.from_key(private_key)
     address = account.address
 
-    weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
+    weth_contract = w3.eth.contract(
+        address=Web3.to_checksum_address("0x4200000000000000000000000000000000000006"),  # WETH on Base
+        abi=[{"inputs":[],"name":"deposit","outputs":[],"stateMutability":"payable","type":"function"}]
+    )
 
-    # Build tx for deposit()
-    txn = weth_contract.functions.deposit().build_transaction({
-        "from": address,
-        "value": w3.to_wei(amount_eth, "ether"),
-        "gas": 100000,
-        "gasPrice": w3.eth.gas_price,
-        "nonce": w3.eth.get_transaction_count(address),
-        "chainId": 8453  # Base mainnet chainId
-    })
+    try:
+        txn = weth_contract.functions.deposit().build_transaction({
+            "from": address,
+            "value": w3.to_wei(amount_eth, "ether"),
+            "nonce": w3.eth.get_transaction_count(address),
+            "gas": 100000,
+            "gasPrice": w3.eth.gas_price,
+        })
 
-    # Sign & send
-    signed_txn = w3.eth.account.sign_transaction(txn, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-    return w3.to_hex(tx_hash)
+        signed_txn = w3.eth.account.sign_transaction(txn, private_key=private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+        return tx_hash.hex()
+    except Exception as e:
+        print(f"[ERROR] WETH wrap failed: {e}")
+        return None
 
 
-def unwrap_weth_to_eth(private_key: str, amount_eth: float, w3):
-    """Unwrap WETH into ETH on Base chain."""
+# --- Unwrap WETH to ETH ---
+def unwrap_weth_to_eth(private_key: str, amount_eth: float, w3: Web3):
+    """Unwrap WETH into ETH using withdraw() with given RPC."""
+
     account = Account.from_key(private_key)
     address = account.address
 
-    weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
+    weth_contract = w3.eth.contract(
+        address=Web3.to_checksum_address("0x4200000000000000000000000000000000000006"),  # WETH on Base
+        abi=[{"inputs":[{"internalType":"uint256","name":"wad","type":"uint256"}],
+              "name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+    )
 
-    txn = weth_contract.functions.withdraw(
-        w3.to_wei(amount_eth, "ether")
-    ).build_transaction({
-        "from": address,
-        "gas": 100000,
-        "gasPrice": w3.eth.gas_price,
-        "nonce": w3.eth.get_transaction_count(address),
-        "chainId": 8453
-    })
+    try:
+        txn = weth_contract.functions.withdraw(w3.to_wei(amount_eth, "ether")).build_transaction({
+            "from": address,
+            "nonce": w3.eth.get_transaction_count(address),
+            "gas": 100000,
+            "gasPrice": w3.eth.gas_price,
+        })
 
-    signed_txn = w3.eth.account.sign_transaction(txn, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-    return w3.to_hex(tx_hash)
+        signed_txn = w3.eth.account.sign_transaction(txn, private_key=private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+        return tx_hash.hex()
+    except Exception as e:
+        print(f"[ERROR] WETH unwrap failed: {e}")
+        return None
 
 
 # --- Buy Handlers ---
@@ -629,26 +621,25 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # --- Sync Buy Logic --- #
-def do_buy_sync(uid, wallet, private_key, token_out, amount, rpc_url):
+def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     """Synchronous logic that performs one buy trade using a given RPC"""
-    w3 = W3_POOL[rpc_url]
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
 
-    # ✅ Optional: Wrap ETH into WETH if balance low
+    # Wrap ETH if too low
     if get_eth_balance(wallet, w3) <= (amount * 10):
         wrap_eth_to_weth(private_key, amount * 10, w3)
 
     uniswap = Uniswap(
         wallet_address=wallet,
         private_key=private_key,
-        provider=rpc_url,  # must pass correct RPC url
+        provider=rpc_url,
         web3=w3
     )
 
     value = w3.to_wei(amount, "ether")
 
-    # ✅ Normal trade (Uniswap manages nonce internally)
     tx_hash = uniswap.make_trade(
-        from_token="0x4200000000000000000000000000000000000006",  # WETH on Base
+        from_token="0x4200000000000000000000000000000000000006",  # WETH
         to_token=token_out,
         amount=value,
         fee=10000,
@@ -656,6 +647,7 @@ def do_buy_sync(uid, wallet, private_key, token_out, amount, rpc_url):
         pool_version="v3"
     )
     return tx_hash.hex()
+
 
 
 # --- Async Wrapper with Retries + Failover ---
@@ -759,77 +751,68 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- Sync Sell with specific RPC ---
-def do_sell_sync(wallet, private_key, token_in, amount, slippage, rpc_url):
-    """Synchronous logic that performs one sell trade using a given RPC"""
-    w3 = W3_POOL[rpc_url]
-
-    uniswap = Uniswap(
-        wallet_address=wallet,
-        private_key=private_key,
-        provider=rpc_url,
-        web3=w3
-    )
-
-    value = w3.to_wei(amount, "ether")  # adjust decimals if token_in != 18 decimals
-
-    try:
-        tx_hash = uniswap.make_trade(
-            from_token=token_in,
-            to_token="0x4200000000000000000000000000000000000006",  # WETH
-            amount=value,
-            fee=10000,
-            slippage=int(slippage * 100),  # Uniswap lib expects int basis points
-            pool_version="v3",
-        )
-
-        # ✅ optional: unwrap WETH -> ETH if balance > 0
-        weth_balance = get_eth_balance(wallet, w3)
-        if weth_balance > 0:
-            unwrap_weth_to_eth(private_key, weth_balance, w3)
-
-        return tx_hash.hex()
-
-    except Exception as e:
-        raise Exception(f"Sell failed: {e}")
-
-
-# --- Async Wrapper for Sell with retries ---
-async def perform_sell(uid, wallet, private_key, token_in, amount, slippage=0.05, max_retries=3):
+async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05, max_retries=3):
     """
-    Send sell txn and return tx hash immediately after broadcast.
-    Uses user-assigned RPC with retry/fallback across pool.
+    Perform a sell transaction (token -> WETH -> ETH).
+    Uses multiple RPCs with retry + failover.
     """
     loop = asyncio.get_running_loop()
-    delay = 5  # initial retry delay
-
-    # Start with user-assigned RPC
-    base_index = uid % len(RPC_ENDPOINTS)
+    delay = 5  # initial backoff delay
 
     for attempt in range(1, max_retries + 1):
-        rpc_index = (base_index + attempt - 1) % len(RPC_ENDPOINTS)
-        rpc_url = RPC_ENDPOINTS[rpc_index]
+        rpc_url = RPC_LIST[(attempt - 1) % len(RPC_LIST)]  # rotate through RPCs
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        def sync_sell():
+            try:
+                uniswap = Uniswap(
+                    wallet_address=wallet,
+                    private_key=private_key,
+                    provider=rpc_url,
+                    web3=w3
+                )
+
+                value = w3.to_wei(amount, "ether")
+
+                # Perform sell: token_in -> WETH
+                tx_hash = uniswap.make_trade(
+                    from_token=token_in,
+                    to_token="0x4200000000000000000000000000000000000006",  # WETH
+                    amount=value,
+                    fee=10000,
+                    slippage=int(slippage * 100),
+                    pool_version="v3",
+                )
+
+                # After selling, unwrap WETH -> ETH if balance > 0
+                weth_balance = get_eth_balance(wallet, w3)
+                if weth_balance > 0:
+                    unwrap_weth_to_eth(private_key, weth_balance, w3)
+
+                return f"✅ Sell successful!\n🔗 https://basescan.org/tx/{tx_hash.hex()}"
+
+            except Exception as e:
+                return f"⚠️ Sell failed: {str(e)}"
 
         try:
-            tx_hash = await asyncio.wait_for(
-                loop.run_in_executor(
-                    executor,
-                    do_sell_sync,
-                    uid, wallet, private_key, token_in, amount, slippage, rpc_url
-                ),
+            # Run in thread pool so it's non-blocking
+            result = await asyncio.wait_for(
+                loop.run_in_executor(executor, sync_sell),
                 timeout=30
             )
-            return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash}"
+            return result
 
         except asyncio.TimeoutError:
             if attempt == max_retries:
-                raise Exception(f"Sell timed out after {max_retries} attempts (last RPC={rpc_url})")
+                return f"⚠️ Sell timed out after {max_retries} attempts (last RPC={rpc_url})"
             print(f"[WARN] Sell timed out (attempt {attempt}, RPC={rpc_url}), retrying in {delay}s...")
 
         except Exception as e:
             if attempt == max_retries:
-                raise
+                return f"⚠️ Sell failed permanently: {str(e)}"
             print(f"[WARN] Sell failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
 
+        # Exponential backoff with jitter
         await asyncio.sleep(delay + random.uniform(0, 2))
         delay = min(delay * 2, 60)
 
