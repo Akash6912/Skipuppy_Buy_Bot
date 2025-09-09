@@ -975,6 +975,12 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                     await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
                 if get_eth_balance(wallet, w3) > 0:
                     unwrap_weth_to_eth(private_key, get_eth_balance(wallet, w3), w3)
+                progress_file = f"progress_{uid}.json"
+                if os.path.exists(progress_file):
+                    try:
+                        os.remove(progress_file)
+                    except Exception as e:
+                        print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
                 user_swap_state.pop(uid, None)
                 return
 
