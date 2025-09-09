@@ -672,7 +672,7 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, max_retries=3
                 loop.run_in_executor(
                     executor,
                     do_buy_sync,
-                    uid, wallet, private_key, token_out, amount, rpc_url
+                    wallet, private_key, token_out, amount, rpc_url
                 ),
                 timeout=30  # shorter timeout since we're not waiting for confirmation
             )
