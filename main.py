@@ -47,9 +47,9 @@ RPC_ENDPOINTS = [
 # Keep web3 instances per endpoint
 W3_POOL = [Web3(Web3.HTTPProvider(rpc)) for rpc in RPC_ENDPOINTS]
 
-
 # Reuse a thread pool for blocking web3 calls
 executor = ThreadPoolExecutor(max_workers=30)
+
 
 def get_user_w3(uid: int) -> Web3:
     """
@@ -456,6 +456,7 @@ withdraw_handler = ConversationHandler(
     per_chat=True
 )
 
+
 # ================= Wrap/Unwrap eth Handlers ================= #
 # --- Wrap ETH to WETH ---
 def wrap_eth_to_weth(private_key: str, amount_eth: float, w3: Web3):
@@ -466,7 +467,7 @@ def wrap_eth_to_weth(private_key: str, amount_eth: float, w3: Web3):
 
     weth_contract = w3.eth.contract(
         address=Web3.to_checksum_address("0x4200000000000000000000000000000000000006"),  # WETH on Base
-        abi=[{"inputs":[],"name":"deposit","outputs":[],"stateMutability":"payable","type":"function"}]
+        abi=[{"inputs": [], "name": "deposit", "outputs": [], "stateMutability": "payable", "type": "function"}]
     )
 
     try:
@@ -495,8 +496,8 @@ def unwrap_weth_to_eth(private_key: str, amount_eth: float, w3: Web3):
 
     weth_contract = w3.eth.contract(
         address=Web3.to_checksum_address("0x4200000000000000000000000000000000000006"),  # WETH on Base
-        abi=[{"inputs":[{"internalType":"uint256","name":"wad","type":"uint256"}],
-              "name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+        abi=[{"inputs": [{"internalType": "uint256", "name": "wad", "type": "uint256"}],
+              "name": "withdraw", "outputs": [], "stateMutability": "nonpayable", "type": "function"}]
     )
 
     try:
@@ -649,7 +650,6 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     return tx_hash.hex()
 
 
-
 # --- Async Wrapper with Retries + Failover ---
 async def perform_buy(uid, wallet, private_key, token_out, amount, max_retries=3):
     """
@@ -760,7 +760,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05, max
     delay = 5  # initial backoff delay
 
     for attempt in range(1, max_retries + 1):
-        rpc_url = RPC_LIST[(attempt - 1) % len(RPC_LIST)]  # rotate through RPCs
+        rpc_url = RPC_ENDPOINTS[(attempt - 1) % len(RPC_ENDPOINTS)]  # rotate through RPCs
         w3 = Web3(Web3.HTTPProvider(rpc_url))
 
         def sync_sell():
@@ -815,7 +815,6 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05, max
         # Exponential backoff with jitter
         await asyncio.sleep(delay + random.uniform(0, 2))
         delay = min(delay * 2, 60)
-
 
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,7 +1108,6 @@ async def auto_resume_all(bot):
 
     if not resumed_any:
         print("[INFO] No active swaps found. Bot restarted without auto-resume.")
-
 
 
 # ================= Shutdown Handlers ================= #
