@@ -456,13 +456,14 @@ withdraw_handler = ConversationHandler(
     per_chat=True
 )
 
-
 # ================= Wrap/Unwrap eth Handlers ================= #
 # WETH contract address on Base
 WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
 WETH_ABI = [
-    {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable", "type": "function"},
-    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [], "payable": False, "stateMutability": "nonpayable", "type": "function"},
+    {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable",
+     "type": "function"},
+    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [],
+     "payable": False, "stateMutability": "nonpayable", "type": "function"},
 ]
 
 
@@ -800,7 +801,7 @@ async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05, max
                 # After selling, unwrap WETH -> ETH if balance > 0
                 weth_balance = get_eth_balance(wallet, w3)
                 if weth_balance > 0:
-                    unwrap_weth_to_eth(private_key, weth_balance, w3)
+                    unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
 
                 return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
 
@@ -905,7 +906,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             try:
                 # Lock ensures no overlapping swaps for SAME user
                 result = await with_user_lock(uid, perform_buy(uid, wallet, private_key, token_out, amount))
-                await context.bot.send_message(chat_id=query.message.chat_id, text=result)
+                await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ Buy successful!\n🔗 https://basescan.org/tx/0x{result.hex()}")
             except Exception as e:
                 err_msg = extract_error_message(e)
                 await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {err_msg}")
@@ -986,8 +987,10 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
             if user_swap_state.get(uid, {}).get("cancel"):
                 if msg:
                     await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
+
+                weth_balance = get_eth_balance(wallet, w3)
                 if get_eth_balance(wallet, w3) > 0:
-                    unwrap_weth_to_eth(private_key, get_eth_balance(wallet, w3), w3)
+                    unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
                 progress_file = f"progress_{uid}.json"
                 if os.path.exists(progress_file):
                     try:
@@ -1064,8 +1067,9 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(3)
+    weth_balance = get_eth_balance(wallet, w3)
     if get_eth_balance(wallet, w3) > 0:
-        unwrap_weth_to_eth(private_key, get_eth_balance(wallet, w3), w3)
+        unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
     await show_main_menu(None, context, edit=True)
 
 
