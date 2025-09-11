@@ -980,7 +980,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 "chainId": 8453
             })
             signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
-            approve_hash = w3.eth.send_raw_transaction(signed_approve.rawTransaction)
+            approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
             w3.eth.wait_for_transaction_receipt(approve_hash)
             print(f"[DEBUG] Approved token: {approve_hash.hex()}")
 
@@ -1001,7 +1001,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 "chainId": 8453
             })
             signed_txn = w3.eth.account.sign_transaction(txn, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
             print(f"[DEBUG] Swap submitted: {tx_hash.hex()}")
 
         else:
