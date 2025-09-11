@@ -703,7 +703,6 @@ ROUTER_ABI = json.loads("""
 """)
 
 
-
 # -------------------------------
 # V2 Sync Buy
 # -------------------------------
@@ -924,14 +923,13 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
     Perform a sell transaction (token -> WETH -> ETH) on either V2 or V3 pool.
     """
     loop = asyncio.get_running_loop()
-    value_wei = Web3.to_wei(amount, "ether")
 
     def sync_sell():
         w3 = Web3(Web3.HTTPProvider(assign_rpc(wallet)))
         print(f"[DEBUG] Using RPC: {w3.provider.endpoint_uri}")
 
         tx_hash = None
-
+        value_wei = Web3.to_wei(amount, "ether")
         if pool_version == "v3":
             print("[DEBUG] Using Uniswap V3 pool")
             uniswap = Uniswap(
@@ -949,6 +947,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 pool_version="v3"
             )
 
+
         elif pool_version == "v2":
             print("[DEBUG] Using Uniswap V2 pool")
             router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
@@ -956,53 +955,71 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
             WETH = w3.to_checksum_address("0x4200000000000000000000000000000000000006")
             path = [TOKEN_IN, WETH]
 
-            # --- Minimal ERC20 ABI for approve ---
+            # --- Minimal ERC20 ABI ---
             ERC20_ABI = json.loads("""
             [
                 {"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
-                {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}
+                {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+                {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+                {"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"}
             ]
             """)
+
             token_contract = w3.eth.contract(address=TOKEN_IN, abi=ERC20_ABI)
 
-            # --- Get starting nonce ---
-            nonce = w3.eth.get_transaction_count(wallet)
+            # --- Get token decimals ---
+            decimals = token_contract.functions.decimals().call()
+            print(f"[DEBUG] Token decimals: {decimals}")
+            # --- Convert amount properly ---
+            value_wei = int(amount * (10 ** decimals))
+            # --- Check balance ---
+            balance = token_contract.functions.balanceOf(wallet).call()
+            print(f"[DEBUG] Wallet balance: {balance / (10 ** decimals)}")
+            if balance < value_wei:
+                raise Exception("❌ Not enough token balance to perform sell")
 
-            # --- Approve router ---
-            print("[DEBUG] Approving token for router...")
-            approve_txn = token_contract.functions.approve(
-                ROUTER_ADDRESS, value_wei
-            ).build_transaction({
-                "from": wallet,
-                "nonce": nonce,
-                "gas": 100000,
-                "gasPrice": int(w3.eth.gas_price * 1.1),  # 10% bump
-                "chainId": 8453
-            })
-            signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
-            approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
-            w3.eth.wait_for_transaction_receipt(approve_hash)
-            print(f"[DEBUG] Approved token: {approve_hash.hex()}")
-
+            # --- Check allowance ---
+            allowance = token_contract.functions.allowance(wallet, ROUTER_ADDRESS).call()
+            print(f"[DEBUG] Current allowance: {allowance / (10 ** decimals)}")
+            if allowance < value_wei:
+                print("[DEBUG] Approving router to spend tokens...")
+                nonce = w3.eth.get_transaction_count(wallet)
+                approve_txn = token_contract.functions.approve(
+                    ROUTER_ADDRESS, value_wei
+                ).build_transaction({
+                    "from": wallet,
+                    "nonce": nonce,
+                    "gas": 60000,
+                    "gasPrice": int(w3.eth.gas_price * 1.1),
+                    "chainId": 8453
+                })
+                signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
+                approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
+                w3.eth.wait_for_transaction_receipt(approve_hash)
+                print(f"[DEBUG] Approved token: {approve_hash.hex()}")
+                nonce += 1
+            else:
+                nonce = w3.eth.get_transaction_count(wallet)
             # --- Swap ---
             print("[DEBUG] Performing swapExactTokensForETH...")
             deadline = w3.eth.get_block("latest")["timestamp"] + 60 * 5
             gas_estimate = router.functions.swapExactTokensForETH(
                 value_wei, 0, path, wallet, deadline
             ).estimate_gas({"from": wallet})
-
             txn = router.functions.swapExactTokensForETH(
                 value_wei, 0, path, wallet, deadline
             ).build_transaction({
                 "from": wallet,
-                "gas": int(gas_estimate * 1.2),  # 20% safety margin
-                "gasPrice": int(w3.eth.gas_price * 1.2),  # bump gas price
-                "nonce": nonce + 1,  # increment nonce
+                "gas": int(gas_estimate * 1.2),
+                "gasPrice": int(w3.eth.gas_price * 1.2),
+                "nonce": nonce,
                 "chainId": 8453
             })
+
             signed_txn = w3.eth.account.sign_transaction(txn, private_key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
             print(f"[DEBUG] Swap submitted: {tx_hash.hex()}")
+
 
         else:
             raise Exception(f"Unknown pool_version: {pool_version}")
@@ -1017,7 +1034,6 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
 
     result = await loop.run_in_executor(executor, sync_sell)
     return result
-
 
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1629,7 +1645,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap|pool_v2|pool_v3"))
 
     app.add_handler(CommandHandler("sell", sell_command))
-    app.add_handler(CallbackQueryHandler(sell_button_handler,pattern="^confirm_sell|cancel_sell|sell_pool_v2|sell_pool_v3$"))
+    app.add_handler(
+        CallbackQueryHandler(sell_button_handler, pattern="^confirm_sell|cancel_sell|sell_pool_v2|sell_pool_v3$"))
 
     app.add_handler(CommandHandler("txnbot", txnbot_command))
     app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap|pool_v2|pool_v3"))
