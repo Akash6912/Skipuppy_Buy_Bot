@@ -311,6 +311,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/buy: Swap ETH → Token\n"
             "/sell: Swap Token → ETH\n"
             "/txnbot: Multi-buy transaction bot\n"
+            "/cancel: Cancel the ongoing txnbot swaps\n"
+            "/remove: To remove the wallet created from database\n"
             "/help: Help & usage guide\n\n"
             "Security reminder: do not share your private key with strangers. Keep the MASTER_KEY safe on the server."
         ),
@@ -918,9 +920,10 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- Sync Sell with specific RPC ---
-async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version, slippage=0.05):
+async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version, slippage=0.05, max_retries=10):
     """
     Perform a sell transaction (token -> WETH -> ETH) on either V2 or V3 pool.
+    Retries until successful or balance < amount.
     """
     loop = asyncio.get_running_loop()
 
@@ -928,8 +931,29 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
         w3 = Web3(Web3.HTTPProvider(assign_rpc(wallet)))
         print(f"[DEBUG] Using RPC: {w3.provider.endpoint_uri}")
 
+        # --- Minimal ERC20 ABI for balance/decimals/approve ---
+        ERC20_ABI = json.loads("""
+        [
+            {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+            {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+            {"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}
+        ]
+        """)
+        token_contract = w3.eth.contract(address=w3.to_checksum_address(token_in), abi=ERC20_ABI)
+
+        decimals = token_contract.functions.decimals().call()
+        balance = token_contract.functions.balanceOf(wallet).call()
+        value_wei = int(amount * (10 ** decimals))
+
+        print(f"[DEBUG] Token decimals: {decimals}")
+        print(f"[DEBUG] Wallet balance: {balance / (10 ** decimals)}")
+        print(f"[DEBUG] Sell amount: {amount}")
+
+        if balance < value_wei:
+            raise ValueError("❌ Not enough token balance")
+
         tx_hash = None
-        value_wei = Web3.to_wei(amount, "ether")
+
         if pool_version == "v3":
             print("[DEBUG] Using Uniswap V3 pool")
             uniswap = Uniswap(
@@ -947,7 +971,6 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 pool_version="v3"
             )
 
-
         elif pool_version == "v2":
             print("[DEBUG] Using Uniswap V2 pool")
             router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
@@ -955,64 +978,37 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
             WETH = w3.to_checksum_address("0x4200000000000000000000000000000000000006")
             path = [TOKEN_IN, WETH]
 
-            # --- Minimal ERC20 ABI ---
-            ERC20_ABI = json.loads("""
-            [
-                {"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
-                {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},
-                {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
-                {"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"}
-            ]
-            """)
+            # --- Approve router ---
+            print("[DEBUG] Approving token for router...")
+            approve_txn = token_contract.functions.approve(
+                ROUTER_ADDRESS,
+                value_wei
+            ).build_transaction({
+                "from": wallet,
+                "nonce": w3.eth.get_transaction_count(wallet),
+                "gas": 100000,
+                "gasPrice": w3.eth.gas_price
+            })
+            signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
+            approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(approve_hash)
+            print(f"[DEBUG] Approved token: {approve_hash.hex()}")
 
-            token_contract = w3.eth.contract(address=TOKEN_IN, abi=ERC20_ABI)
-
-            # --- Get token decimals ---
-            decimals = token_contract.functions.decimals().call()
-            print(f"[DEBUG] Token decimals: {decimals}")
-            # --- Convert amount properly ---
-            value_wei = int(amount * (10 ** decimals))
-            # --- Check balance ---
-            balance = token_contract.functions.balanceOf(wallet).call()
-            print(f"[DEBUG] Wallet balance: {balance / (10 ** decimals)}")
-            if balance < value_wei:
-                raise Exception("❌ Not enough token balance to perform sell")
-
-            # --- Check allowance ---
-            allowance = token_contract.functions.allowance(wallet, ROUTER_ADDRESS).call()
-            print(f"[DEBUG] Current allowance: {allowance / (10 ** decimals)}")
-            if allowance < value_wei:
-                print("[DEBUG] Approving router to spend tokens...")
-                nonce = w3.eth.get_transaction_count(wallet)
-                approve_txn = token_contract.functions.approve(
-                    ROUTER_ADDRESS, value_wei
-                ).build_transaction({
-                    "from": wallet,
-                    "nonce": nonce,
-                    "gas": 60000,
-                    "gasPrice": int(w3.eth.gas_price * 1.1),
-                    "chainId": 8453
-                })
-                signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
-                approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
-                w3.eth.wait_for_transaction_receipt(approve_hash)
-                print(f"[DEBUG] Approved token: {approve_hash.hex()}")
-                nonce += 1
-            else:
-                nonce = w3.eth.get_transaction_count(wallet)
             # --- Swap ---
             print("[DEBUG] Performing swapExactTokensForETH...")
             deadline = w3.eth.get_block("latest")["timestamp"] + 60 * 5
             gas_estimate = router.functions.swapExactTokensForETH(
                 value_wei, 0, path, wallet, deadline
             ).estimate_gas({"from": wallet})
+            gas_price = w3.eth.gas_price
+
             txn = router.functions.swapExactTokensForETH(
                 value_wei, 0, path, wallet, deadline
             ).build_transaction({
                 "from": wallet,
-                "gas": int(gas_estimate * 1.2),
-                "gasPrice": int(w3.eth.gas_price * 1.2),
-                "nonce": nonce,
+                "gas": int(gas_estimate * 1.1),
+                "gasPrice": gas_price,
+                "nonce": w3.eth.get_transaction_count(wallet),
                 "chainId": 8453
             })
 
@@ -1020,20 +1016,26 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
             tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
             print(f"[DEBUG] Swap submitted: {tx_hash.hex()}")
 
-
         else:
             raise Exception(f"Unknown pool_version: {pool_version}")
 
-        # --- Unwrap WETH -> ETH if any ---
-        weth_balance = get_eth_balance(wallet, w3)
-        if weth_balance > 0:
-            print(f"[DEBUG] Unwrapping WETH -> ETH: {weth_balance}")
-            unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
-
         return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
 
-    result = await loop.run_in_executor(executor, sync_sell)
-    return result
+    # --- Retry logic ---
+    delay = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = await loop.run_in_executor(executor, sync_sell)
+            return result  # ✅ success
+        except ValueError as e:
+            # balance too low → stop
+            return str(e)
+        except Exception as e:
+            print(f"[WARN] Sell attempt {attempt} failed: {e}. Retrying in {delay}s...")
+            await asyncio.sleep(delay + random.uniform(0, 2))
+            delay = min(delay * 2, 60)
+
+    return f"⚠️ Sell failed after {max_retries} retries"
 
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,13 +1111,19 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("⚠️ Session expired. Start again with /buy or /txnbot.")
         return
 
-    # Cancel flow
+    # --- Cancel flow ---
     if query.data.startswith("cancel_") or query.data == "cancel_swap":
         await query.edit_message_text("❌ Cancelled.")
-        user_swap_state.pop(uid, None)
+        # Just mark cancel flag, don't pop here
+        if uid in user_swap_state:
+            user_swap_state[uid]["cancel"] = True
+            if "task" in user_swap_state[uid]:
+                task = user_swap_state[uid]["task"]
+                if not task.done():
+                    task.cancel()
         return
 
-    # Handle pool selection
+    # --- Pool selection ---
     if query.data in ["pool_v2", "pool_v3"]:
         pool = query.data.replace("pool_", "")  # "v2" or "v3"
         state["pool_version"] = pool
@@ -1126,7 +1134,7 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Show confirmation message after selecting pool
+        # Confirmation message
         if state["mode"] == "buy":
             await query.edit_message_text(
                 f"🔎 Review Swap:\n\n"
@@ -1145,12 +1153,14 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         return
 
-    # Handle confirm
+    # --- Confirm swap ---
     if query.data == "confirm_swap":
         await query.edit_message_text("🚀 Executing swap...")
 
         wallet = row[1]
         private_key = decrypt_privkey(row[2])
+        state["wallet"] = row[1]
+        state["private_key"] = private_key
         token_out = state["token_out"]
         amount = state["amount"]
         pool = state.get("pool_version", "v3")
@@ -1162,6 +1172,10 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     chat_id=uid,
                     text=f"✅ Swap submitted!\n🔗 https://basescan.org/tx/0x{tx_hash}"
                 )
+
+                # Cleanup immediately for one-off swap
+                user_swap_state.pop(uid, None)
+
             elif state["mode"] == "txnbot":
                 count = state["count"]
                 task = asyncio.create_task(
@@ -1172,27 +1186,37 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     chat_id=uid,
                     text=f"🚀 Running {count} swaps of {amount} ETH on {pool.upper()}..."
                 )
+                # ❌ do not pop here → let run_swaps or cancel handle cleanup
+
         except Exception as e:
             await context.bot.send_message(chat_id=uid, text=f"❌ Swap failed: {str(e)}")
-
-        user_swap_state.pop(uid, None)
+            user_swap_state.pop(uid, None)
         return
 
 
 # ------------------- SAVE & LOAD PROGRESS ------------------- #
-def save_progress(uid, wallet, privatekey, token_out, amount, count, current_index, pool_version="v3"):
+def save_progress(uid, wallet, private_key, token_out, amount, count, current_index, pool_version, canceled=False):
+    """
+    Save swap progress so bot can resume after restart.
+    """
     progress = {
         "uid": uid,
         "wallet": wallet,
+        "private_key": private_key,
         "token_out": token_out,
         "amount": amount,
         "count": count,
-        "current_index": current_index,
-        "private_key": privatekey,
-        "pool_version": pool_version  # ✅ new field
+        "current_index": current_index,  # last completed index
+        "pool_version": pool_version,
+        "canceled": canceled
     }
-    with open(f"progress_{uid}.json", "w") as f:
-        json.dump(progress, f)
+    filename = f"progress_{uid}.json"
+    try:
+        with open(filename, "w") as f:
+            json.dump(progress, f)
+        print(f"[DEBUG] Progress saved")
+    except Exception as e:
+        print(f"[ERROR] Failed to save progress for {uid}: {e}")
 
 
 def load_progress(uid):
@@ -1222,25 +1246,11 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
         attempt = 0
 
         while True:
-            if user_swap_state.get(uid, {}).get("cancel"):
-                if msg:
-                    await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
-
-                weth_balance = get_eth_balance(wallet, w3)
-                if weth_balance > 0:
-                    unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
-
-                progress_file = f"progress_{uid}.json"
-                if os.path.exists(progress_file):
-                    try:
-                        os.remove(progress_file)
-                    except Exception as e:
-                        print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
-
-                user_swap_state.pop(uid, None)
-                return
-
             try:
+                # ✅ check for cancel flag before doing anything
+                if user_swap_state.get(uid, {}).get("cancel"):
+                    raise asyncio.CancelledError("Swap cancelled by user")
+
                 fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
 
                 tx_hash = await asyncio.wait_for(
@@ -1264,10 +1274,29 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
                         text=f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]"
                     )
 
-                # save progress
+                # ✅ save progress
                 save_progress(uid, wallet, private_key, token_out, amount, count, i,
                               pool_version=pool_version)
                 break  # move to next swap
+
+            except asyncio.CancelledError:
+                # 🛑 Hard stop on cancel
+                if msg:
+                    await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
+
+                weth_balance = get_eth_balance(wallet, w3)
+                if weth_balance > 0:
+                    unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
+
+                progress_file = f"progress_{uid}.json"
+                if os.path.exists(progress_file):
+                    try:
+                        os.remove(progress_file)
+                    except Exception as e:
+                        print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
+
+                user_swap_state.pop(uid, None)
+                return  # ✅ exit immediately
 
             except Exception as e:
                 tb = traceback.format_exc()
@@ -1333,6 +1362,7 @@ async def auto_resume_all(bot):
                 with open(file, "r") as f:
                     progress = json.load(f)
 
+                # skip if canceled
                 if progress.get("canceled"):
                     continue
 
@@ -1341,31 +1371,39 @@ async def auto_resume_all(bot):
                 token_out = progress["token_out"]
                 amount = progress["amount"]
                 count = progress["count"]
-                start_index = progress["current_index"] + 1
                 private_key = progress["private_key"]
-                pool_version = progress.get("pool_version", "v3")  # default to v3
+                pool_version = progress.get("pool_version", "v3")
 
+                # resume from NEXT swap
+                start_index = progress["current_index"] + 1
+                if start_index >= count:
+                    print(f"[INFO] All swaps already completed for {uid}, skipping.")
+                    continue
+
+                # restore state
                 user_swap_state[uid] = {
                     "wallet": wallet,
                     "private_key": private_key,
                     "token_out": token_out,
                     "amount": amount,
                     "count": count,
-                    "current_index": start_index,
+                    "current_index": progress["current_index"],
                     "pool_version": pool_version,
-                    "task": None
+                    "task": None,
+                    "cancel": False
                 }
 
                 try:
                     await bot.send_message(
                         chat_id=uid,
                         text=(f"⚡ Bot restarted.\n"
-                              f"Auto-resuming swaps {start_index}/{count} "
+                              f"Auto-resuming swaps {start_index + 1}/{count} "
                               f"on {pool_version.upper()}...")
                     )
                 except Exception as e:
                     print(f"[WARN] Failed to notify {uid}: {e}")
 
+                # start background task
                 task = asyncio.create_task(
                     run_swaps(uid, wallet, private_key, token_out, amount,
                               count, start_index, bot, pool_version=pool_version)
@@ -1431,24 +1469,34 @@ async def cancel_swap(uid, bot):
     Cancel the active swap for a user and prevent auto-resume.
     """
     if uid in user_swap_state:
+        state = user_swap_state[uid]
+
+        # ✅ save progress as canceled
+        save_progress(
+            uid=uid,
+            wallet=state.get("wallet"),
+            private_key=state.get("private_key"),
+            token_out=state.get("token_out"),
+            amount=state.get("amount"),
+            count=state.get("count"),
+            current_index=state.get("current_index", 0),
+            pool_version=state.get("pool_version", "v3"),
+            canceled=True
+        )
+
         # set cancel flag
-        user_swap_state[uid]["cancel"] = True
+        state["cancel"] = True
 
         # cancel background task if directly referenced
-        if user_swap_state[uid].get("task"):
-            task = user_swap_state[uid]["task"]
+        if state.get("task"):
+            task = state["task"]
             task.cancel()
 
-        # remove progress file
-        progress_file = f"progress_{uid}.json"
-        if os.path.exists(progress_file):
-            try:
-                os.remove(progress_file)
-            except Exception as e:
-                print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
+        # progress file stays (with canceled flag)
+        # → auto_resume_all() will skip it
 
-        # do not pop here yet → let loop clean itself gracefully
-        # user_swap_state.pop(uid, None)
+        # clean memory state
+        user_swap_state.pop(uid, None)
 
     # notify user
     try:
@@ -1457,7 +1505,7 @@ async def cancel_swap(uid, bot):
         pass
 
 
-# ================= Rmove Message Handler ================= #
+# ================= Remove Message Handler ================= #
 
 # store pending remove requests
 pending_remove = {}  # uid -> True
@@ -1598,6 +1646,12 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif data == "txnbot":
         await txnbot_command(update, context)
 
+    elif data == "cancel":
+        await cancel_handler(update, context)
+
+    elif data == "remove":
+        await remove_command(update, context)
+
     elif data == "help":
         await help_handler(update, context)
 
@@ -1626,7 +1680,7 @@ async def on_startup(app):
 
 
 # ================= Main ================= #
-async def main():
+def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(TOKEN).post_init(set_commands).post_init(on_startup).read_timeout(
         60).write_timeout(60).build()
@@ -1663,16 +1717,8 @@ async def main():
 
     logger.info("Bot started. Press Ctrl+C to stop.")
     # Run polling asynchronously
-    await app.initialize()  # ensures ExtBot is ready
-    await app.start()
-    await app.updater.start_polling()
-
-    try:
-        await asyncio.Event().wait()  # keeps the bot alive
-    finally:
-        await app.stop()  # gracefully stop bot
-        await app.shutdown()  # clean up resources
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
