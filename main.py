@@ -10,7 +10,6 @@ import requests
 import sqlite3
 import warnings
 import ast
-import signal
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import BytesIO
@@ -579,7 +578,7 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             except ValueError:
                 await update.message.reply_text("⚠️ Invalid ETH amount. Enter a number.")
 
-        # -------- SELL FLOW --------
+    # -------- SELL FLOW --------
     elif state.get("mode") == "sell":
         if state["step"] == "token_in":
             state["token_in"] = update.message.text.strip()
@@ -588,20 +587,19 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         elif state["step"] == "amount":
             try:
-                amount = float(update.message.text.strip())
-                state["amount"] = amount
+                state["amount"] = float(update.message.text.strip())
+                state["step"] = "pool_version"
 
-                keyboard = [[
-                    InlineKeyboardButton("✅ Confirm", callback_data="confirm_sell"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_sell")
-                ]]
+                keyboard = [
+                    [InlineKeyboardButton("V2", callback_data="sell_pool_v2"),
+                     InlineKeyboardButton("V3", callback_data="sell_pool_v3")]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 await update.message.reply_text(
-                    f"Sell {amount} of {state['token_in']} → ETH ?",
+                    f"Select pool version for selling {state['amount']} of {state['token_in']}:",
                     reply_markup=reply_markup
                 )
-                state["step"] = "confirm"
             except ValueError:
                 await update.message.reply_text("⚠️ Invalid token amount. Enter a number.")
 
@@ -672,15 +670,38 @@ WETH = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
 
 ROUTER_ABI = json.loads("""
 [
-  {"inputs":[{"internalType":"uint256","name":"amountOutMin","type":"uint256"},
-             {"internalType":"address[]","name":"path","type":"address[]"},
-             {"internalType":"address","name":"to","type":"address"},
-             {"internalType":"uint256","name":"deadline","type":"uint256"}],
-   "name":"swapExactETHForTokens",
-   "outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
-   "stateMutability":"payable","type":"function"}
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+      {"internalType": "address[]", "name": "path", "type": "address[]"},
+      {"internalType": "address", "name": "to", "type": "address"},
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "swapExactTokensForETH",
+    "outputs": [
+      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+      {"internalType": "address[]", "name": "path", "type": "address[]"},
+      {"internalType": "address", "name": "to", "type": "address"},
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "swapExactETHForTokens",
+    "outputs": [
+      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  }
 ]
 """)
+
 
 
 # -------------------------------
@@ -893,75 +914,109 @@ def get_eth_balance(address, w3):
 
 # --- SELL COMMAND ---
 async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Enter token address to sell:")
+    await update.effective_message.reply_text("Enter token address you want to sell:")
     user_swap_state[update.effective_user.id] = {"step": "token_in", "mode": "sell"}
 
 
 # --- Sync Sell with specific RPC ---
-async def perform_sell(wallet, private_key, token_in, amount, slippage=0.05, max_retries=3):
+async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version, slippage=0.05):
     """
-    Perform a sell transaction (token -> WETH -> ETH).
-    Uses multiple RPCs with retry + failover.
+    Perform a sell transaction (token -> WETH -> ETH) on either V2 or V3 pool.
     """
     loop = asyncio.get_running_loop()
-    delay = 5  # initial backoff delay
+    value_wei = Web3.to_wei(amount, "ether")
 
-    for attempt in range(1, max_retries + 1):
-        rpc_url = RPC_ENDPOINTS[(attempt - 1) % len(RPC_ENDPOINTS)]  # rotate through RPCs
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
+    def sync_sell():
+        w3 = Web3(Web3.HTTPProvider(assign_rpc(wallet)))
+        print(f"[DEBUG] Using RPC: {w3.provider.endpoint_uri}")
 
-        def sync_sell():
-            try:
-                uniswap = Uniswap(
-                    wallet_address=wallet,
-                    private_key=private_key,
-                    provider=rpc_url,
-                    web3=w3
-                )
+        tx_hash = None
 
-                value = w3.to_wei(amount, "ether")
-
-                # Perform sell: token_in -> WETH
-                tx_hash = uniswap.make_trade(
-                    from_token=token_in,
-                    to_token="0x4200000000000000000000000000000000000006",  # WETH
-                    amount=value,
-                    fee=10000,
-                    slippage=int(slippage * 100),
-                    pool_version="v3",
-                )
-
-                # After selling, unwrap WETH -> ETH if balance > 0
-                weth_balance = get_eth_balance(wallet, w3)
-                if weth_balance > 0:
-                    unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
-
-                return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
-
-            except Exception as e:
-                return f"⚠️ Sell failed: {str(e)}"
-
-        try:
-            # Run in thread pool so it's non-blocking
-            result = await asyncio.wait_for(
-                loop.run_in_executor(executor, sync_sell),
-                timeout=30
+        if pool_version == "v3":
+            print("[DEBUG] Using Uniswap V3 pool")
+            uniswap = Uniswap(
+                wallet_address=wallet,
+                private_key=private_key,
+                provider=w3.provider.endpoint_uri,
+                web3=w3
             )
-            return result
+            tx_hash = uniswap.make_trade(
+                from_token=token_in,
+                to_token="0x4200000000000000000000000000000000000006",  # WETH
+                amount=value_wei,
+                fee=10000,
+                slippage=int(slippage * 100),
+                pool_version="v3"
+            )
 
-        except asyncio.TimeoutError:
-            if attempt == max_retries:
-                return f"⚠️ Sell timed out after {max_retries} attempts (last RPC={rpc_url})"
-            print(f"[WARN] Sell timed out (attempt {attempt}, RPC={rpc_url}), retrying in {delay}s...")
+        elif pool_version == "v2":
+            print("[DEBUG] Using Uniswap V2 pool")
+            router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
+            TOKEN_IN = w3.to_checksum_address(token_in)
+            WETH = w3.to_checksum_address("0x4200000000000000000000000000000000000006")
+            path = [TOKEN_IN, WETH]
 
-        except Exception as e:
-            if attempt == max_retries:
-                return f"⚠️ Sell failed permanently: {str(e)}"
-            print(f"[WARN] Sell failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
+            # --- Minimal ERC20 ABI for approve ---
+            ERC20_ABI = json.loads("""
+            [
+                {"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
+                {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}
+            ]
+            """)
 
-        # Exponential backoff with jitter
-        await asyncio.sleep(delay + random.uniform(0, 2))
-        delay = min(delay * 2, 60)
+            token_contract = w3.eth.contract(address=TOKEN_IN, abi=ERC20_ABI)
+
+            # --- Approve router ---
+            print("[DEBUG] Approving token for router...")
+            approve_txn = token_contract.functions.approve(
+                ROUTER_ADDRESS,
+                value_wei
+            ).build_transaction({
+                "from": wallet,
+                "nonce": w3.eth.get_transaction_count(wallet),
+                "gas": 100000,
+                "gasPrice": w3.eth.gas_price
+            })
+            signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
+            approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
+            w3.eth.wait_for_transaction_receipt(approve_hash)
+            print(f"[DEBUG] Approved token: {approve_hash.hex()}")
+
+            # --- Swap ---
+            print("[DEBUG] Performing swapExactTokensForETH...")
+            deadline = w3.eth.get_block("latest")["timestamp"] + 60 * 5
+            gas_estimate = router.functions.swapExactTokensForETH(
+                value_wei, 0, path, wallet, deadline
+            ).estimate_gas({"from": wallet})
+            gas_price = w3.eth.gas_price
+
+            txn = router.functions.swapExactTokensForETH(
+                value_wei, 0, path, wallet, deadline
+            ).build_transaction({
+                "from": wallet,
+                "gas": int(gas_estimate * 1.1),
+                "gasPrice": gas_price,
+                "nonce": w3.eth.get_transaction_count(wallet),
+                "chainId": 8453
+            })
+
+            signed_txn = w3.eth.account.sign_transaction(txn, private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            print(f"[DEBUG] Swap submitted: {tx_hash.hex()}")
+
+        else:
+            raise Exception(f"Unknown pool_version: {pool_version}")
+
+        # --- Unwrap WETH -> ETH if any ---
+        weth_balance = get_eth_balance(wallet, w3)
+        if weth_balance > 0:
+            print(f"[DEBUG] Unwrapping WETH -> ETH: {weth_balance}")
+            unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
+
+        return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
+
+    result = await loop.run_in_executor(executor, sync_sell)
+    return result
 
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -970,36 +1025,56 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     uid = query.from_user.id
 
     if uid not in user_swap_state:
-        await query.edit_message_text("❌ No active sell process found.")
+        await query.edit_message_text("⚠️ Session expired. Start again with /sell.")
         return
 
     state = user_swap_state[uid]
 
-    if query.data == "cancel_sell":
+    # -------- CANCEL --------
+    if query.data.startswith("cancel_sell"):
         await query.edit_message_text("❌ Sell cancelled.")
         user_swap_state.pop(uid, None)
         return
 
+    # -------- SELECT POOL --------
+    elif query.data in ["sell_pool_v2", "sell_pool_v3"]:
+        state["pool_version"] = query.data.split("_")[-1]
+        state["step"] = "confirm"
+
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirm", callback_data="confirm_sell"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_sell")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"Sell {state['amount']} of {state['token_in']} using {state['pool_version']} pool?\nConfirm to proceed.",
+            reply_markup=reply_markup
+        )
+
+    # -------- CONFIRM SELL --------
     elif query.data == "confirm_sell":
         wallet_data = get_wallet_row(uid)
         wallet = wallet_data[1]
         private_key = decrypt_privkey(wallet_data[2])
         token_in = state["token_in"]
         amount = state["amount"]
+        pool_version = state["pool_version"]
 
-        await query.edit_message_text("⏳ Selling token...")
+        await query.edit_message_text(f"⏳ Selling {amount} of {token_in} using {pool_version} pool...")
 
-        # Non-blocking sell
-        result_msg = await perform_sell(wallet, private_key, token_in, amount)
-        await context.bot.send_message(chat_id=query.message.chat_id, text=result_msg)
+        async def task():
+            try:
+                result_msg = await perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version)
+                await context.bot.send_message(chat_id=query.message.chat_id, text=result_msg)
+            finally:
+                user_swap_state.pop(uid, None)
+                await show_main_menu(update, context, edit=True)
 
-        # Show main menu
-        await show_main_menu(update, context, edit=True)
-        user_swap_state.pop(uid, None)
+        asyncio.create_task(task())
 
 
 # ================= TXNBOT MULTIPLE SWAPS ================= #
-
 async def txnbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address for multiple swaps:")
     user_swap_state[update.effective_user.id] = {"step": "token_out", "mode": "txnbot"}
@@ -1365,6 +1440,61 @@ async def cancel_swap(uid, bot):
         pass
 
 
+# ================= Rmove Message Handler ================= #
+
+# store pending remove requests
+pending_remove = {}  # uid -> True
+
+
+# Step 1: User types /remove
+async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    row = get_wallet_row(uid)
+
+    if not row:
+        await update.message.reply_text("❌ No wallet found for your account.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, remove", callback_data="confirm_remove"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "⚠️ Are you sure you want to remove your wallet?\n"
+        "You will **not** be able to access funds if you haven't saved your private key.\n\n"
+        "Next time you press /start, a new wallet will be created.",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+
+# Step 2: Handle confirm/cancel
+async def remove_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+
+    if query.data == "cancel_remove":
+        await query.edit_message_text("❌ Wallet removal cancelled.")
+        return
+
+    elif query.data == "confirm_remove":
+        conn = sqlite3.connect("wallets.db")
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wallets WHERE telegram_id=?", (uid,))
+        conn.commit()
+        conn.close()
+
+        await query.edit_message_text(
+            "✅ Your wallet has been removed.\n"
+            "Press /start to create a new wallet."
+        )
+
+
 # ================= Error Message Handler ================= #
 def extract_error_message(e: Exception) -> str:
     """Extract a clean error message from an exception, handling dicts and stringified dicts."""
@@ -1468,7 +1598,8 @@ async def set_commands(app):
         BotCommand("sell", "Swap Token → ETH"),
         BotCommand("txnbot", "Multi-buy transaction bot"),
         BotCommand("help", "Help & usage guide"),
-        BotCommand("cancel", "To cancel any ongoing swaps")
+        BotCommand("cancel", "To cancel any ongoing swaps"),
+        BotCommand("remove", "To remove the current wallet from database")
     ])
 
 
@@ -1497,7 +1628,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap|pool_v2|pool_v3"))
 
     app.add_handler(CommandHandler("sell", sell_command))
-    app.add_handler(CallbackQueryHandler(sell_button_handler, pattern="confirm_sell|cancel_sell"))
+    app.add_handler(CallbackQueryHandler(sell_button_handler,pattern="^confirm_sell|cancel_sell|sell_pool_v2|sell_pool_v3$"))
 
     app.add_handler(CommandHandler("txnbot", txnbot_command))
     app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap|pool_v2|pool_v3"))
@@ -1505,6 +1636,9 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, swap_handle_message))
 
     app.add_handler(CommandHandler("cancel", cancel_handler))
+
+    app.add_handler(CommandHandler("remove", remove_command))
+    app.add_handler(CallbackQueryHandler(remove_button_handler, pattern="^(confirm_remove|cancel_remove)$"))
 
     app.add_handler(CallbackQueryHandler(menu_button_handler,
                                          pattern="^(mywallet|exportkey|balance|deposit|buy|sell|txnbot|help)$"))
