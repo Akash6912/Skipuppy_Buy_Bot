@@ -542,40 +542,45 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in user_swap_state:
+    state = user_swap_state.get(uid)
+
+    if not state:
+        await update.message.reply_text("⚠️ No active swap session. Start again with /buy or /txnbot.")
         return
 
-    state = user_swap_state[uid]
-    mode = state.get("mode")
-
-    # -------- BUY FLOW --------
-    if mode == "buy":
+    # --- BUY flow ---
+    if state.get("mode") == "buy":
         if state["step"] == "token_out":
-            state["token_out"] = update.message.text.strip()
+            token_out = update.message.text.strip()
+            state["token_out"] = token_out
             state["step"] = "amount"
-            await update.message.reply_text("Enter ETH amount to swap:")
+            await update.message.reply_text(
+                f"Enter amount of ETH to swap for {token_out}:"
+            )
 
         elif state["step"] == "amount":
             try:
                 amount = float(update.message.text.strip())
                 state["amount"] = amount
 
+                # ✅ Ask pool selection (instead of confirm directly)
                 keyboard = [[
-                    InlineKeyboardButton("✅ Confirm", callback_data="confirm_swap"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_swap")
+                    InlineKeyboardButton("Uniswap V2", callback_data="pool_v2"),
+                    InlineKeyboardButton("Uniswap V3", callback_data="pool_v3")
                 ]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 await update.message.reply_text(
-                    f"Swap {amount} ETH → {state['token_out']} ?",
+                    f"Choose pool version for swapping {amount} ETH → {state['token_out']}:",
                     reply_markup=reply_markup
                 )
-                state["step"] = "confirm"
+                state["step"] = "pool"
+
             except ValueError:
                 await update.message.reply_text("⚠️ Invalid ETH amount. Enter a number.")
 
-    # -------- SELL FLOW --------
-    elif mode == "sell":
+        # -------- SELL FLOW --------
+    elif state.get("mode") == "sell":
         if state["step"] == "token_in":
             state["token_in"] = update.message.text.strip()
             state["step"] = "amount"
@@ -600,39 +605,47 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             except ValueError:
                 await update.message.reply_text("⚠️ Invalid token amount. Enter a number.")
 
-    # -------- MULTIPLE SWAPS FLOW (/txnbot) --------
-    elif mode == "txnbot":
+    # --- TXNBOT flow ---
+    elif state.get("mode") == "txnbot":
         if state["step"] == "token_out":
-            state["token_out"] = update.message.text.strip()
+            token_out = update.message.text.strip()
+            state["token_out"] = token_out
             state["step"] = "amount"
-            await update.message.reply_text("Enter ETH amount to swap each time:")
+            await update.message.reply_text(
+                f"Enter amount of ETH per transaction to swap for {token_out}:"
+            )
 
         elif state["step"] == "amount":
             try:
-                state["amount"] = float(update.message.text.strip())
+                amount = float(update.message.text.strip())
+                state["amount"] = amount
                 state["step"] = "count"
-                await update.message.reply_text("How many times do you want to swap?")
+                await update.message.reply_text(
+                    "How many transactions do you want to run?"
+                )
             except ValueError:
-                await update.message.reply_text("⚠️ Invalid amount. Enter a number.")
+                await update.message.reply_text("⚠️ Invalid ETH amount. Enter a number.")
 
         elif state["step"] == "count":
             try:
-                state["count"] = int(update.message.text.strip())
+                count = int(update.message.text.strip())
+                state["count"] = count
 
+                # ✅ Ask pool selection
                 keyboard = [[
-                    InlineKeyboardButton("✅ Confirm", callback_data="confirm_txnbot"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_txnbot")
+                    InlineKeyboardButton("Uniswap V2", callback_data="pool_v2"),
+                    InlineKeyboardButton("Uniswap V3", callback_data="pool_v3")
                 ]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 await update.message.reply_text(
-                    f"Swap {state['amount']} ETH → {state['token_out']} "
-                    f"{state['count']} times?",
+                    f"Choose pool version for {count} swaps of {state['amount']} ETH → {state['token_out']}:",
                     reply_markup=reply_markup
                 )
-                state["step"] = "confirm"
+                state["step"] = "pool"
+
             except ValueError:
-                await update.message.reply_text("⚠️ Invalid number. Enter an integer.")
+                await update.message.reply_text("⚠️ Invalid count. Enter a number.")
 
 
 # --- Sync Buy Logic --- #
@@ -653,12 +666,104 @@ def assign_rpc(uid: int) -> str:
     return user_rpc_map[uid]
 
 
-# --- Core Buy Logic (Sync) ---
-def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
-    """Synchronous logic that performs one buy trade using a given RPC."""
+# --- Uniswap V2 Router Config (Base) ---
+ROUTER_ADDRESS = Web3.to_checksum_address("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
+WETH = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
+
+ROUTER_ABI = json.loads("""
+[
+  {"inputs":[{"internalType":"uint256","name":"amountOutMin","type":"uint256"},
+             {"internalType":"address[]","name":"path","type":"address[]"},
+             {"internalType":"address","name":"to","type":"address"},
+             {"internalType":"uint256","name":"deadline","type":"uint256"}],
+   "name":"swapExactETHForTokens",
+   "outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
+   "stateMutability":"payable","type":"function"}
+]
+""")
+
+
+# -------------------------------
+# V2 Sync Buy
+# -------------------------------
+def do_buy_sync_v2(wallet, private_key, token_out, amount, rpc_url):
+    """Perform Uniswap V2 ETH -> Token buy (Base chain) with debug logging."""
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
+
+    TOKEN_OUT = Web3.to_checksum_address(token_out)
+
+    # Deadline for txn validity
+    deadline = w3.eth.get_block("latest")["timestamp"] + 60 * 5  # 5 min
+    path = [WETH, TOKEN_OUT]
+
+    print("🔹 Starting Uniswap V2 swap...")
+    print(f"   → Wallet: {wallet}")
+    print(f"   → RPC URL: {rpc_url}")
+    print(f"   → Swap amount (ETH): {amount}")
+    print(f"   → Token Out: {TOKEN_OUT}")
+    print(f"   → Path: {path}")
+    print(f"   → Deadline (unix): {deadline}")
+
+    # --- Estimate gas ---
+    try:
+        gas_estimate = router.functions.swapExactETHForTokens(
+            0, path, wallet, deadline
+        ).estimate_gas({
+            "from": wallet,
+            "value": w3.to_wei(amount, "ether"),
+        })
+        print(f"   ✅ Gas estimate: {gas_estimate} units")
+    except Exception as e:
+        print(f"   ❌ Gas estimation failed: {e}")
+        raise
+
+    # --- Fetch gas price ---
+    gas_price = w3.eth.gas_price
+    print(f"   → Current gas price: {gas_price} wei ({w3.from_wei(gas_price, 'gwei')} gwei)")
+
+    # --- Get nonce ---
+    nonce = w3.eth.get_transaction_count(wallet)
+    print(f"   → Nonce: {nonce}")
+
+    # --- Build transaction ---
+    txn = router.functions.swapExactETHForTokens(
+        0, path, wallet, deadline
+    ).build_transaction({
+        "from": wallet,
+        "value": w3.to_wei(amount, "ether"),
+        "gas": int(gas_estimate * 1.1),  # add 10% buffer
+        "gasPrice": gas_price,
+        "nonce": nonce,
+        "chainId": 8453,  # Base mainnet
+    })
+
+    print("   ✅ Transaction built:")
+    print(f"      - Value (ETH): {amount}")
+    print(f"      - Gas (with buffer): {txn['gas']}")
+    print(f"      - Gas Price: {txn['gasPrice']} wei")
+    print(f"      - Nonce: {txn['nonce']}")
+    print(f"      - ChainID: {txn['chainId']}")
+
+    # --- Sign transaction ---
+    signed_txn = w3.eth.account.sign_transaction(txn, private_key=private_key)
+    print(f"   🔑 Transaction signed (hash preview): {signed_txn.hash.hex()}")
+
+    # --- Send transaction ---
+    tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+    print(f"   🚀 Transaction broadcasted! Tx Hash: {tx_hash.hex()}")
+
+    return tx_hash.hex()
+
+
+# -------------------------------
+# V3 Sync Buy
+# -------------------------------
+def do_buy_sync_v3(wallet, private_key, token_out, amount, rpc_url):
+    """Perform Uniswap V3 ETH -> Token buy (Base chain)."""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
 
-    # Wrap ETH if too low
+    # Ensure ETH balance is enough / wrap if needed
     if get_eth_balance(wallet, w3) <= (amount * 10):
         wrap_eth_to_weth(private_key, amount * 10, w3)
 
@@ -672,7 +777,7 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     value = w3.to_wei(amount, "ether")
 
     tx_hash = uniswap.make_trade(
-        from_token="0x4200000000000000000000000000000000000006",  # WETH on Base
+        from_token=WETH,
         to_token=token_out,
         amount=value,
         fee=10000,
@@ -682,33 +787,46 @@ def do_buy_sync(wallet, private_key, token_out, amount, rpc_url):
     return tx_hash.hex()
 
 
-# --- Async Wrapper with Retries + Failover ---
-async def perform_buy(uid, wallet, private_key, token_out, amount, max_retries=3):
+# -------------------------------
+# Unified Async Wrapper
+# -------------------------------
+async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version="v3", max_retries=3):
     """
-    Send swap txn and return tx hash immediately after broadcast (no confirmation wait).
-    Uses per-user round-robin RPC assignment with retry/fallback.
+    Unified buy function: supports Uniswap V2 and V3.
+    - pool_version="v2" or "v3"
+    - Retries with round-robin RPCs on failure
     """
     loop = asyncio.get_running_loop()
     delay = 5
 
-    # sticky RPC for this user
     base_rpc = assign_rpc(uid)
     base_index = RPC_ENDPOINTS.index(base_rpc)
 
     for attempt in range(1, max_retries + 1):
         rpc_url = RPC_ENDPOINTS[(base_index + attempt - 1) % len(RPC_ENDPOINTS)]
         try:
-            tx_hash = await asyncio.wait_for(
-                loop.run_in_executor(
-                    executor,
-                    do_buy_sync,
-                    wallet, private_key, token_out, amount, rpc_url
-                ),
-                timeout=30
-            )
+            if pool_version == "v2":
+                tx_hash = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        executor,
+                        do_buy_sync_v2,
+                        wallet, private_key, token_out, amount, rpc_url
+                    ),
+                    timeout=30
+                )
+            else:  # default = v3
+                tx_hash = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        executor,
+                        do_buy_sync_v3,
+                        wallet, private_key, token_out, amount, rpc_url
+                    ),
+                    timeout=30
+                )
+
             if not tx_hash:
                 raise Exception("No tx hash returned")
-            return tx_hash  # ✅ return raw tx hash immediately
+            return tx_hash  # ✅ raw tx hash immediately
 
         except asyncio.TimeoutError:
             if attempt == max_retries:
@@ -892,80 +1010,85 @@ async def buy_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
-    tid = uid
+    row = get_wallet_row(uid)
 
-    row = get_wallet_row(tid)
-    w3 = get_user_w3(uid)
-    if uid not in user_swap_state:
+    state = user_swap_state.get(uid)
+    if not state:
+        await query.edit_message_text("⚠️ Session expired. Start again with /buy or /txnbot.")
         return
 
-    state = user_swap_state[uid]
-
-    # Handle cancel
-    if query.data.startswith("cancel_"):
+    # Cancel flow
+    if query.data.startswith("cancel_") or query.data == "cancel_swap":
         await query.edit_message_text("❌ Cancelled.")
         user_swap_state.pop(uid, None)
         return
 
-    wallet = row[1]
-    private_key = decrypt_privkey(row[2])
+    # Handle pool selection
+    if query.data in ["pool_v2", "pool_v3"]:
+        pool = query.data.replace("pool_", "")  # "v2" or "v3"
+        state["pool_version"] = pool
 
-    # ---------------- SINGLE BUY ---------------- #
-    if query.data == "confirm_swap" and state.get("mode") == "buy":
-        token_out = state["token_out"]
-        amount = state["amount"]
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirm", callback_data="confirm_swap"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_swap")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await query.edit_message_text("⏳ Swapping ETH...")
-
-        async def task():
-            try:
-                # Lock ensures no overlapping swaps for SAME user
-                result = await with_user_lock(uid, perform_buy(uid, wallet, private_key, token_out, amount))
-                await context.bot.send_message(chat_id=query.message.chat_id,
-                                               text=f"✅ Buy successful!\n🔗 https://basescan.org/tx/0x{result}")
-            except Exception as e:
-                err_msg = extract_error_message(e)
-                await context.bot.send_message(chat_id=query.message.chat_id, text=f"⚠️ Swap failed.\nError: {err_msg}")
-            finally:
-                await asyncio.sleep(3)
-                await show_main_menu(update, context, edit=True)
-                user_swap_state.pop(uid, None)
-
-        # 🚀 Run in background (don’t await!)
-        asyncio.create_task(task())
+        # Show confirmation message after selecting pool
+        if state["mode"] == "buy":
+            await query.edit_message_text(
+                f"🔎 Review Swap:\n\n"
+                f"Swap {state['amount']} ETH → {state['token_out']}\n"
+                f"Pool: {pool.upper()}\n\n"
+                f"Proceed?",
+                reply_markup=reply_markup
+            )
+        elif state["mode"] == "txnbot":
+            await query.edit_message_text(
+                f"🔎 Review Batch Swaps:\n\n"
+                f"{state['count']} swaps of {state['amount']} ETH → {state['token_out']}\n"
+                f"Pool: {pool.upper()}\n\n"
+                f"Proceed?",
+                reply_markup=reply_markup
+            )
         return
 
-    # ------------------- START MULTI SWAPS ------------------- #
-    elif query.data == "confirm_txnbot" and state.get("mode") == "txnbot":
-        token_out = state["token_out"]
-        amount = state["amount"]  # in ETH
-        count = state["count"]
+    # Handle confirm
+    if query.data == "confirm_swap":
+        await query.edit_message_text("🚀 Executing swap...")
 
-        user_swap_state[uid]["cancel"] = False
+        wallet = row[1]
+        private_key = decrypt_privkey(row[2])
+        token_out = state["token_out"]
+        amount = state["amount"]
+        pool = state.get("pool_version", "v3")
 
         try:
-            balance = w3.eth.get_balance(wallet) / 1e18
-            if balance < amount * count:
-                await query.edit_message_text(
-                    f"❌ Insufficient balance.\n\nNeed {amount * count:.6f} ETH "
-                    f"for {count} swaps, but only have {balance:.6f} ETH."
+            if state["mode"] == "buy":
+                tx_hash = await perform_buy(uid, wallet, private_key, token_out, amount, pool)
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"✅ Swap submitted!\n🔗 https://basescan.org/tx/0x{tx_hash}"
                 )
-                return
+            elif state["mode"] == "txnbot":
+                count = state["count"]
+                task = asyncio.create_task(
+                    run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context, pool)
+                )
+                user_swap_state[uid]["task"] = task
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"🚀 Running {count} swaps of {amount} ETH on {pool.upper()}..."
+                )
         except Exception as e:
-            log_error_to_file(uid, query.from_user.username, f"Balance check failed: {str(e)}")
-            await query.edit_message_text("⚠️ Could not fetch balance, aborting swaps.")
-            return
+            await context.bot.send_message(chat_id=uid, text=f"❌ Swap failed: {str(e)}")
 
-        await query.edit_message_text(f"⏳ Starting {count} swaps...")
-        msg = await context.bot.send_message(chat_id=query.message.chat_id, text="Swaps in progress...")
-
-        asyncio.create_task(run_swaps(uid, wallet, private_key, token_out, amount, count, 0, context))
-
+        user_swap_state.pop(uid, None)
         return
 
 
 # ------------------- SAVE & LOAD PROGRESS ------------------- #
-def save_progress(uid, wallet, privatekey, token_out, amount, count, current_index):
+def save_progress(uid, wallet, privatekey, token_out, amount, count, current_index, pool_version="v3"):
     progress = {
         "uid": uid,
         "wallet": wallet,
@@ -973,7 +1096,8 @@ def save_progress(uid, wallet, privatekey, token_out, amount, count, current_ind
         "amount": amount,
         "count": count,
         "current_index": current_index,
-        "private_key": privatekey
+        "private_key": privatekey,
+        "pool_version": pool_version  # ✅ new field
     }
     with open(f"progress_{uid}.json", "w") as f:
         json.dump(progress, f)
@@ -982,19 +1106,25 @@ def save_progress(uid, wallet, privatekey, token_out, amount, count, current_ind
 def load_progress(uid):
     try:
         with open(f"progress_{uid}.json", "r") as f:
-            return json.load(f)
+            progress = json.load(f)
+        # ✅ default to v3 if older progress file doesn’t have pool_version
+        if "pool_version" not in progress:
+            progress["pool_version"] = "v3"
+        return progress
     except FileNotFoundError:
         return None
 
 
 # ------------------- RESUMABLE SWAP LOOP ------------------- #
-async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_index=0, context=None):
+async def run_swaps(uid, wallet, private_key, token_out, amount, count,
+                    start_index=0, context=None, pool_version="v3"):
     success_count = start_index
     msg = None
 
     w3 = get_user_w3(uid)
     if get_eth_balance(wallet, w3) <= (amount * 10):
         wrap_eth_to_weth(private_key, amount * count, w3)
+
     for i in range(start_index, count):
         retry_delay = 1
         attempt = 0
@@ -1005,14 +1135,16 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                     await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
 
                 weth_balance = get_eth_balance(wallet, w3)
-                if get_eth_balance(wallet, w3) > 0:
+                if weth_balance > 0:
                     unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
+
                 progress_file = f"progress_{uid}.json"
                 if os.path.exists(progress_file):
                     try:
                         os.remove(progress_file)
                     except Exception as e:
                         print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
+
                 user_swap_state.pop(uid, None)
                 return
 
@@ -1020,7 +1152,10 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                 fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
 
                 tx_hash = await asyncio.wait_for(
-                    with_user_lock(uid, perform_buy(uid, wallet, private_key, token_out, amount)),
+                    with_user_lock(
+                        uid,
+                        perform_buy(uid, wallet, private_key, token_out, amount, pool_version=pool_version)
+                    ),
                     timeout=30
                 )
 
@@ -1030,20 +1165,22 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
                 success_count += 1
 
                 if msg:
-                    await safe_edit(uid, None, msg, f"✅ Swap {i + 1}/{count}")
+                    await safe_edit(uid, None, msg, f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]")
                 else:
                     msg = await context.bot.send_message(
                         chat_id=uid,
-                        text=f"✅ Swap {i + 1}/{count}"
+                        text=f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]"
                     )
 
                 # save progress
-                save_progress(uid, wallet, private_key, token_out, amount, count, i)
+                save_progress(uid, wallet, private_key, token_out, amount, count, i,
+                              pool_version=pool_version)
                 break  # move to next swap
 
             except Exception as e:
                 tb = traceback.format_exc()
-                log_error_to_file(uid, None, f"⚠️ Swap {i + 1} crashed: {str(e)}\n{tb}")
+                log_error_to_file(uid, None,
+                                  f"⚠️ Swap {i + 1} crashed [{pool_version.upper()}]: {str(e)}\n{tb}")
                 attempt += 1
 
                 err_msg = extract_error_message(e).lower()
@@ -1079,13 +1216,15 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count, start_in
         pass
 
     if msg:
-        await safe_edit(uid, None, msg, f"🎉 Completed {success_count}/{count} swaps")
+        await safe_edit(uid, None, msg, f"🎉 Completed {success_count}/{count} swaps [{pool_version.upper()}]")
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(3)
+
     weth_balance = get_eth_balance(wallet, w3)
-    if get_eth_balance(wallet, w3) > 0:
+    if weth_balance > 0:
         unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
+
     await show_main_menu(None, context, edit=True)
 
 
@@ -1102,7 +1241,6 @@ async def auto_resume_all(bot):
                 with open(file, "r") as f:
                     progress = json.load(f)
 
-                # Skip canceled swaps
                 if progress.get("canceled"):
                     continue
 
@@ -1113,8 +1251,8 @@ async def auto_resume_all(bot):
                 count = progress["count"]
                 start_index = progress["current_index"] + 1
                 private_key = progress["private_key"]
+                pool_version = progress.get("pool_version", "v3")  # default to v3
 
-                # Register user swap state
                 user_swap_state[uid] = {
                     "wallet": wallet,
                     "private_key": private_key,
@@ -1122,22 +1260,23 @@ async def auto_resume_all(bot):
                     "amount": amount,
                     "count": count,
                     "current_index": start_index,
+                    "pool_version": pool_version,
                     "task": None
                 }
 
-                # Notify user
                 try:
                     await bot.send_message(
                         chat_id=uid,
                         text=(f"⚡ Bot restarted.\n"
-                              f"Auto-resuming swaps {start_index}/{count}...")
+                              f"Auto-resuming swaps {start_index}/{count} "
+                              f"on {pool_version.upper()}...")
                     )
                 except Exception as e:
                     print(f"[WARN] Failed to notify {uid}: {e}")
 
-                # Start swaps as a background task
                 task = asyncio.create_task(
-                    run_swaps(uid, wallet, private_key, token_out, amount, count, start_index, bot)
+                    run_swaps(uid, wallet, private_key, token_out, amount,
+                              count, start_index, bot, pool_version=pool_version)
                 )
                 user_swap_state[uid]["task"] = task
                 resumed_any = True
@@ -1147,48 +1286,6 @@ async def auto_resume_all(bot):
 
     if not resumed_any:
         print("[INFO] No active swaps found. Bot restarted without auto-resume.")
-
-
-# ================= Shutdown Handlers ================= #
-async def notify_shutdown(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Notify all users that the bot is stopping due to server-side maintenance
-    or background work. Active swap states are preserved for auto-resume.
-    """
-    for file in os.listdir("."):
-        if file.startswith("progress_") and file.endswith(".json"):
-            try:
-                with open(file, "r") as f:
-                    state = json.load(f)
-                uid = state.get("uid")
-                if uid:
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=(
-                            "⚠️ The bot has been stopped due to some background work.\n"
-                            "⏳ Your swaps are paused and will resume automatically when the bot restarts."
-                        )
-                    )
-            except Exception as e:
-                print(f"[WARN] Failed to notify user from {file}: {e}")
-
-
-def setup_shutdown_handler(app: Application):
-    loop = asyncio.get_event_loop()
-
-    async def shutdown_sequence():
-        print("[INFO] Bot is shutting down, notifying users...")
-        await notify_shutdown(app)
-        await asyncio.sleep(1)  # wait a moment to ensure messages are sent
-        await app.stop()
-        print("[INFO] Shutdown complete.")
-
-    def handler(sig, frame):
-        print(f"[INFO] Received signal {sig}, starting shutdown sequence...")
-        asyncio.create_task(shutdown_sequence())
-
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
 
 
 # ================= Cancel Handler ================= #
@@ -1370,7 +1467,8 @@ async def set_commands(app):
         BotCommand("buy", "Swap ETH → Token"),
         BotCommand("sell", "Swap Token → ETH"),
         BotCommand("txnbot", "Multi-buy transaction bot"),
-        BotCommand("help", "Help & usage guide")
+        BotCommand("help", "Help & usage guide"),
+        BotCommand("cancel", "To cancel any ongoing swaps")
     ])
 
 
@@ -1380,9 +1478,10 @@ async def on_startup(app):
 
 
 # ================= Main ================= #
-def main():
+async def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(TOKEN).post_init(set_commands).post_init(on_startup).build()
+    app = Application.builder().token(TOKEN).post_init(set_commands).post_init(on_startup).read_timeout(
+        60).write_timeout(60).build()
 
     app.add_handler(CommandHandler("start", start_handler))
 
@@ -1395,13 +1494,13 @@ def main():
     app.add_handler(withdraw_handler)
 
     app.add_handler(CommandHandler("buy", buy_command))
-    app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap"))
+    app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap|pool_v2|pool_v3"))
 
     app.add_handler(CommandHandler("sell", sell_command))
     app.add_handler(CallbackQueryHandler(sell_button_handler, pattern="confirm_sell|cancel_sell"))
 
     app.add_handler(CommandHandler("txnbot", txnbot_command))
-    app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="^(confirm_txnbot|cancel_txnbot)$"))
+    app.add_handler(CallbackQueryHandler(buy_button_handler, pattern="confirm_swap|cancel_swap|pool_v2|pool_v3"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, swap_handle_message))
 
@@ -1410,10 +1509,18 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_button_handler,
                                          pattern="^(mywallet|exportkey|balance|deposit|buy|sell|txnbot|help)$"))
 
-    setup_shutdown_handler(app)
     logger.info("Bot started. Press Ctrl+C to stop.")
-    app.run_polling()
+    # Run polling asynchronously
+    await app.initialize()  # ensures ExtBot is ready
+    await app.start()
+    await app.updater.start_polling()
+
+    try:
+        await asyncio.Event().wait()  # keeps the bot alive
+    finally:
+        await app.stop()  # gracefully stop bot
+        await app.shutdown()  # clean up resources
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
