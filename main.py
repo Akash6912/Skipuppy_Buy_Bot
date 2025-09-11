@@ -963,22 +963,24 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}
             ]
             """)
-
             token_contract = w3.eth.contract(address=TOKEN_IN, abi=ERC20_ABI)
+
+            # --- Get starting nonce ---
+            nonce = w3.eth.get_transaction_count(wallet)
 
             # --- Approve router ---
             print("[DEBUG] Approving token for router...")
             approve_txn = token_contract.functions.approve(
-                ROUTER_ADDRESS,
-                value_wei
+                ROUTER_ADDRESS, value_wei
             ).build_transaction({
                 "from": wallet,
-                "nonce": w3.eth.get_transaction_count(wallet),
+                "nonce": nonce,
                 "gas": 100000,
-                "gasPrice": w3.eth.gas_price
+                "gasPrice": int(w3.eth.gas_price * 1.1),  # 10% bump
+                "chainId": 8453
             })
             signed_approve = w3.eth.account.sign_transaction(approve_txn, private_key=private_key)
-            approve_hash = w3.eth.send_raw_transaction(signed_approve.raw_transaction)
+            approve_hash = w3.eth.send_raw_transaction(signed_approve.rawTransaction)
             w3.eth.wait_for_transaction_receipt(approve_hash)
             print(f"[DEBUG] Approved token: {approve_hash.hex()}")
 
@@ -988,20 +990,18 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
             gas_estimate = router.functions.swapExactTokensForETH(
                 value_wei, 0, path, wallet, deadline
             ).estimate_gas({"from": wallet})
-            gas_price = w3.eth.gas_price
 
             txn = router.functions.swapExactTokensForETH(
                 value_wei, 0, path, wallet, deadline
             ).build_transaction({
                 "from": wallet,
-                "gas": int(gas_estimate * 1.1),
-                "gasPrice": gas_price,
-                "nonce": w3.eth.get_transaction_count(wallet),
+                "gas": int(gas_estimate * 1.2),  # 20% safety margin
+                "gasPrice": int(w3.eth.gas_price * 1.2),  # bump gas price
+                "nonce": nonce + 1,  # increment nonce
                 "chainId": 8453
             })
-
             signed_txn = w3.eth.account.sign_transaction(txn, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
             print(f"[DEBUG] Swap submitted: {tx_hash.hex()}")
 
         else:
@@ -1017,6 +1017,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
 
     result = await loop.run_in_executor(executor, sync_sell)
     return result
+
 
 
 async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
