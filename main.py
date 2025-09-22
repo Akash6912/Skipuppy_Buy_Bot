@@ -705,6 +705,12 @@ ROUTER_ABI = json.loads("""
 ]
 """)
 
+ERC20_ABI = [
+    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+     "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
+]
+
 
 # -------------------------------
 # V2 Sync Buy
@@ -1095,9 +1101,43 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ================= TXNBOT MULTIPLE SWAPS ================= #
+TOKEN_CONTRACT = "0x2fF5bE03a5456aB99836cc2caA4Ae0d158680581"  # required token
+MIN_BALANCE = 100  # minimum amount of token needed to use txnbot (adjust as needed)
+
+
 async def txnbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    row = get_wallet_row(uid)
+    if not row:
+        await update.effective_message.reply_text("⚠️ Wallet not found. Please create/import a wallet first.")
+        return
+
+    wallet_address = row[1]
+    w3 = get_user_w3(uid)
+
+    try:
+        token_contract = w3.eth.contract(address=TOKEN_CONTRACT, abi=ERC20_ABI)
+        balance = token_contract.functions.balanceOf(wallet_address).call()
+        decimals = token_contract.functions.decimals().call()
+        token_balance = balance / (10 ** decimals)
+
+        if token_balance < MIN_BALANCE:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ You need at least <b>{MIN_BALANCE}</b> tokens of \n <b>Skipuppy</b>: <code>{TOKEN_CONTRACT}</code> \nto use /txnbot.\n"
+                     f"Your current balance: {token_balance:.6f}\n"
+                     f"Please deposit or buy the required tokens first.",
+                parse_mode="HTML"
+            )
+            return
+
+    except Exception as e:
+        await update.effective_message.reply_text(f"⚠️ Failed to check token balance: {str(e)}")
+        return
+
+    # If balance is sufficient, continue with txnbot flow
     await update.effective_message.reply_text("Enter token address for multiple swaps:")
-    user_swap_state[update.effective_user.id] = {"step": "token_out", "mode": "txnbot"}
+    user_swap_state[uid] = {"step": "token_out", "mode": "txnbot"}
 
 
 # --- BUTTON HANDLER (Single Buy / Multiple Buy) --- #
