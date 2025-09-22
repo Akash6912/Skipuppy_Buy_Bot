@@ -1,4 +1,5 @@
 import random
+import time
 import traceback
 import aiohttp
 import asyncio
@@ -786,8 +787,8 @@ def do_buy_sync_v3(wallet, private_key, token_out, amount, rpc_url):
     w3 = Web3(Web3.HTTPProvider(rpc_url))
 
     # Ensure ETH balance is enough / wrap if needed
-    if get_eth_balance(wallet, w3) <= (amount * 10):
-        wrap_eth_to_weth(private_key, amount * 10, w3)
+    wrap_eth_to_weth(private_key, amount, w3)
+    time.sleep(0.1)
 
     uniswap = Uniswap(
         wallet_address=wallet,
@@ -1231,15 +1232,89 @@ def load_progress(uid):
         return None
 
 
+# ------------------- ETH HANDLER ------------------- #
+def send_eth_from_master(w3, from_address, from_key, to_address, amount):
+    """
+    Send ETH synchronously. Raises exception if fails.
+    """
+    amount_wei = w3.to_wei(amount, "ether")
+    nonce = w3.eth.get_transaction_count(from_address)
+    tx = {
+        "to": to_address,
+        "value": int(amount_wei),
+        "gas": 21000,
+        "gasPrice": w3.eth.gas_price,
+        "nonce": nonce,
+        "chainId": 8453
+    }
+    signed_tx = w3.eth.account.sign_transaction(tx, from_key)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    w3.eth.wait_for_transaction_receipt(tx_hash)
+    return tx_hash
+
+
+def sweep_leftover_eth(w3, temp_private_key, temp_address, master_wallet, max_retries=5, buffer_percent=0.02):
+    """
+    Sweep all leftover ETH from a temp wallet to a master wallet safely.
+    Handles tiny balances, retries transient failures, uses EIP-1559 gas,
+    and leaves a percentage buffer to prevent insufficient funds errors.
+    """
+    print(f"[INFO] Starting sweep from {temp_address} → {master_wallet}")
+    gas_limit = 21000  # standard ETH transfer
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Use pending balance to include unconfirmed outgoing txs
+            balance = w3.eth.get_balance(temp_address, block_identifier="pending")
+            if balance <= 0:
+                print(f"[INFO] Balance is zero, nothing to sweep.")
+                return None
+
+            max_priority_fee = w3.eth.max_priority_fee
+            base_fee = w3.eth.get_block('pending').baseFeePerGas
+            max_fee = int(base_fee * 1.2 + max_priority_fee)  # 20% buffer
+
+            tx_cost = gas_limit * max_fee
+            # Leave percentage buffer for safety
+            buffer_wei = int(balance * buffer_percent)
+            send_amount = balance - tx_cost - buffer_wei
+
+            if send_amount <= 0:
+                print(f"[INFO] Balance too low after gas and percentage buffer. Skipping sweep.")
+                return None
+
+            nonce = w3.eth.get_transaction_count(temp_address, "pending")
+
+            tx = {
+                "to": master_wallet,
+                "value": int(send_amount),
+                "gas": gas_limit,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "nonce": nonce,
+                "chainId": 8453
+            }
+
+            signed_tx = w3.eth.account.sign_transaction(tx, temp_private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+            print(f"[SUCCESS] Swept {send_amount} wei to master wallet. TX: {w3.to_hex(tx_hash)}")
+            return tx_hash
+
+        except Exception as e:
+            print(f"[WARN] Sweep attempt {attempt} failed: {e}")
+            time.sleep(1)  # small delay before retry
+
+    print(f"[ERROR] Failed to sweep leftover ETH from {temp_address} after {max_retries} attempts.")
+    return None
+
+
 # ------------------- RESUMABLE SWAP LOOP ------------------- #
 async def run_swaps(uid, wallet, private_key, token_out, amount, count,
                     start_index=0, context=None, pool_version="v3"):
-    success_count = start_index
-    msg = None
-
     w3 = get_user_w3(uid)
-    if get_eth_balance(wallet, w3) <= (amount * 10):
-        wrap_eth_to_weth(private_key, amount * count, w3)
+    msg = None
+    success_count = start_index
 
     for i in range(start_index, count):
         retry_delay = 1
@@ -1247,106 +1322,106 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
 
         while True:
             try:
-                # ✅ check for cancel flag before doing anything
+                # check for cancel
                 if user_swap_state.get(uid, {}).get("cancel"):
                     raise asyncio.CancelledError("Swap cancelled by user")
 
-                fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
+                # ✅ create temp wallet
+                temp_private_key, temp_address = create_new_eth_wallet()
+                temp_address = Web3.to_checksum_address(temp_address)
 
-                tx_hash = await asyncio.wait_for(
-                    with_user_lock(
-                        uid,
-                        perform_buy(uid, wallet, private_key, token_out, amount, pool_version=pool_version)
-                    ),
-                    timeout=30
+                # send ETH from master to temp
+                send_eth_from_master(w3, wallet, private_key,
+                                     temp_address, 0.00001)
+
+                # perform swap from temp wallet
+                tx_hash = await with_user_lock(
+                    uid,
+                    perform_buy(uid, temp_address, temp_private_key, token_out,
+                                amount, pool_version=pool_version)
                 )
-
                 if not tx_hash:
                     raise Exception("Swap failed: no tx hash returned")
 
+                # sweep leftover ETH back to master wallet
+                leftover_eth = w3.eth.get_balance(temp_address)
+                if leftover_eth > 0:
+                    try:
+                        sweep_leftover_eth(w3, temp_private_key, temp_address, wallet)
+                    except Exception as e:
+                        print(f"[WARN] Sweeping leftovers failed: {e}")
+
                 success_count += 1
 
+                # update progress
+                save_progress(uid, wallet, private_key,
+                              token_out, amount, count, i,
+                              pool_version=pool_version)
+
+                # notify user
                 if msg:
-                    await safe_edit(uid, None, msg, f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]")
+                    await safe_edit(uid, None, msg,
+                                    f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]")
                 else:
                     msg = await context.bot.send_message(
                         chat_id=uid,
                         text=f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]"
                     )
-
-                # ✅ save progress
-                save_progress(uid, wallet, private_key, token_out, amount, count, i,
-                              pool_version=pool_version)
                 break  # move to next swap
 
             except asyncio.CancelledError:
-                # 🛑 Hard stop on cancel
+                # cleanup
                 if msg:
                     await safe_edit(uid, None, msg, f"🛑 Swap cancelled at {i + 1}/{count}")
-
-                weth_balance = get_eth_balance(wallet, w3)
-                if weth_balance > 0:
-                    unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
-
-                progress_file = f"progress_{uid}.json"
-                if os.path.exists(progress_file):
-                    try:
-                        os.remove(progress_file)
-                    except Exception as e:
-                        print(f"[WARN] Failed to remove progress file {progress_file}: {e}")
-
+                try:
+                    weth_balance = get_eth_balance(wallet, w3)
+                    if weth_balance > 0:
+                        unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
+                except Exception as e:
+                    print(f"[WARN] unwrap failed: {e}")
+                try:
+                    os.remove(f"progress_{uid}.json")
+                except FileNotFoundError:
+                    pass
                 user_swap_state.pop(uid, None)
-                return  # ✅ exit immediately
+                return
 
             except Exception as e:
-                tb = traceback.format_exc()
-                log_error_to_file(uid, None,
-                                  f"⚠️ Swap {i + 1} crashed [{pool_version.upper()}]: {str(e)}\n{tb}")
                 attempt += 1
-
                 err_msg = extract_error_message(e).lower()
+                log_error_to_file(uid, None,
+                                  f"⚠️ Swap {i + 1} crashed [{pool_version.upper()}]: {str(e)}")
 
-                if "insufficient" in err_msg or "not enough balance" in err_msg:
+                # specific handling
+                if "insufficient" in err_msg:
                     if msg:
-                        await safe_edit(uid, None, msg,
-                                        f"❌ Swap {i + 1} failed: {err_msg}\n💡 Stopping bot.")
+                        await safe_edit(uid, None, msg, f"❌ Swap {i + 1} failed: {err_msg}. Stopping.")
                     user_swap_state.pop(uid, None)
                     return
 
                 if "nonce" in err_msg:
                     try:
                         fresh_nonce = w3.eth.get_transaction_count(wallet, "pending")
-                        if msg:
-                            await safe_edit(uid, None, msg,
-                                            f"🔄 Resynced nonce={fresh_nonce}, retrying swap {i + 1}...")
+                        await safe_edit(uid, None, msg or await context.bot.send_message(
+                            chat_id=uid, text=f"🔄 Resynced nonce={fresh_nonce}, retrying..."))
                     except Exception as nonce_err:
-                        log_error_to_file(uid, None,
-                                          f"[⚠️ Nonce Resync Failed] {str(nonce_err)}")
-
-                if msg:
-                    await safe_edit(uid, None, msg,
-                                    f"⚠️ Swap {i + 1} failed: {err_msg}, retrying in {retry_delay}s...")
+                        print(f"[WARN] Nonce resync failed: {nonce_err}")
 
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 10)
 
-    # 🎉 Cleanup after completion
+    # ✅ all done cleanup
     try:
         os.remove(f"progress_{uid}.json")
     except FileNotFoundError:
         pass
 
     if msg:
-        await safe_edit(uid, None, msg, f"🎉 Completed {success_count}/{count} swaps [{pool_version.upper()}]")
+        await safe_edit(uid, None, msg,
+                        f"🎉 Completed {success_count}/{count} swaps [{pool_version.upper()}]")
 
     user_swap_state.pop(uid, None)
-    await asyncio.sleep(3)
-
-    weth_balance = get_eth_balance(wallet, w3)
-    if weth_balance > 0:
-        unwrap_weth_to_eth(private_key, w3.to_wei(weth_balance, "ether"), w3)
-
-    await show_main_menu(None, context, edit=True)
+    await asyncio.sleep(2)
 
 
 # ------------------- AUTO-RESUME ON BOT START ------------------- #
