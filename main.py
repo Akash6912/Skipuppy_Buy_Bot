@@ -469,7 +469,7 @@ WETH_ABI = [
 ]
 
 
-def wrap_eth_to_weth(private_key: str, amount_eth: float, w3: Web3) -> str:
+def wrap_eth_to_weth(private_key, amount_eth, w3: Web3) -> str:
     """Wrap ETH into WETH safely (with pending nonce + gas bump)."""
     try:
         account = Account.from_key(private_key)
@@ -794,7 +794,7 @@ def do_buy_sync_v3(wallet, private_key, token_out, amount, rpc_url):
 
     # Ensure ETH balance is enough / wrap if needed
     wrap_eth_to_weth(private_key, amount, w3)
-    time.sleep(0.1)
+    time.sleep(1)
 
     uniswap = Uniswap(
         wallet_address=wallet,
