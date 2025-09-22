@@ -1374,6 +1374,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
                 send_eth_from_master(w3, wallet, private_key,
                                      temp_address, 0.00001)
 
+                await asyncio.sleep(1)
                 # perform swap from temp wallet
                 tx_hash = await with_user_lock(
                     uid,
