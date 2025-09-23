@@ -30,12 +30,69 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 load_dotenv(override=True)
 
+# ================= GLOBAL VARIABLES ================= #
+TOKEN_CONTRACT = "0x2fF5bE03a5456aB99836cc2caA4Ae0d158680581"  # required token
+MIN_BALANCE = 100  # minimum amount of token needed to use txnbot (adjust as needed)
+WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
+ROUTER_ADDRESS = Web3.to_checksum_address("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
+ROUTER_ABI = json.loads("""
+[
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+      {"internalType": "address[]", "name": "path", "type": "address[]"},
+      {"internalType": "address", "name": "to", "type": "address"},
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "swapExactTokensForETH",
+    "outputs": [
+      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+      {"internalType": "address[]", "name": "path", "type": "address[]"},
+      {"internalType": "address", "name": "to", "type": "address"},
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "swapExactETHForTokens",
+    "outputs": [
+      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  }
+]
+""")
+
+ERC20_ABI = [
+    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+     "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
+]
+WETH_ABI = [
+    {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable",
+     "type": "function"},
+    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [],
+     "payable": False, "stateMutability": "nonpayable", "type": "function"},
+]
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ERROR_LOG_FILE = "swap_errors.txt"
+FERNET_KEY = os.environ.get("MASTER_KEY")
+BATCH_SIZE = 10
+MAX_RETRIES = 5
+
+# ================= STORE VARIABLES ================= #
+user_swap_state = {}
+user_locks = {}
+pending_remove = {}  # uid -> True
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
 # --- Web3 Setup (Base Chain) ---
 # List of available Base RPC endpoints
 RPC_ENDPOINTS = [
@@ -105,7 +162,6 @@ def create_new_eth_wallet():
 
 
 # --- Encryption helpers ---
-FERNET_KEY = os.environ.get("MASTER_KEY")
 if not FERNET_KEY:
     FERNET_KEY = Fernet.generate_key().decode()
     print("⚠️ WARNING: Generated new FERNET_KEY. Save this in your .env to keep wallets consistent:", FERNET_KEY)
@@ -457,17 +513,8 @@ withdraw_handler = ConversationHandler(
     per_chat=True
 )
 
+
 # ================= Wrap/Unwrap eth Handlers ================= #
-# WETH contract address on Base
-WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
-WETH_ABI = [
-    {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable",
-     "type": "function"},
-    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [],
-     "payable": False, "stateMutability": "nonpayable", "type": "function"},
-]
-
-
 def wrap_eth_to_weth(private_key, amount_eth, w3: Web3) -> str:
     """Wrap ETH into WETH safely (with pending nonce + gas bump)."""
     try:
@@ -532,10 +579,6 @@ def unwrap_weth_to_eth(private_key: str, amount_wei: int, w3: Web3) -> str:
 
 
 # --- Buy Handlers ---
-user_swap_state = {}
-user_locks = {}
-
-
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address:")
     user_swap_state[update.effective_user.id] = {"step": "token_out", "mode": "buy"}
@@ -666,51 +709,6 @@ def assign_rpc(uid: int) -> str:
     return user_rpc_map[uid]
 
 
-# --- Uniswap V2 Router Config (Base) ---
-ROUTER_ADDRESS = Web3.to_checksum_address("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
-WETH = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
-
-ROUTER_ABI = json.loads("""
-[
-  {
-    "inputs": [
-      {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
-      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
-      {"internalType": "address[]", "name": "path", "type": "address[]"},
-      {"internalType": "address", "name": "to", "type": "address"},
-      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
-    ],
-    "name": "swapExactTokensForETH",
-    "outputs": [
-      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
-    ],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
-      {"internalType": "address[]", "name": "path", "type": "address[]"},
-      {"internalType": "address", "name": "to", "type": "address"},
-      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
-    ],
-    "name": "swapExactETHForTokens",
-    "outputs": [
-      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
-    ],
-    "stateMutability": "payable",
-    "type": "function"
-  }
-]
-""")
-
-ERC20_ABI = [
-    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
-     "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
-    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
-]
-
-
 # -------------------------------
 # V2 Sync Buy
 # -------------------------------
@@ -723,7 +721,7 @@ def do_buy_sync_v2(wallet, private_key, token_out, amount, rpc_url):
 
     # Deadline for txn validity
     deadline = w3.eth.get_block("latest")["timestamp"] + 60 * 5  # 5 min
-    path = [WETH, TOKEN_OUT]
+    path = [WETH_ADDRESS, TOKEN_OUT]
 
     print("🔹 Starting Uniswap V2 swap...")
     print(f"   → Wallet: {wallet}")
@@ -805,7 +803,7 @@ def do_buy_sync_v3(wallet, private_key, token_out, amount, rpc_url):
     value = w3.to_wei(amount, "ether")
 
     tx_hash = uniswap.make_trade(
-        from_token=WETH,
+        from_token=WETH_ADDRESS,
         to_token=token_out,
         amount=value,
         fee=10000,
@@ -1100,10 +1098,6 @@ async def sell_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ================= TXNBOT MULTIPLE SWAPS ================= #
-TOKEN_CONTRACT = "0x2fF5bE03a5456aB99836cc2caA4Ae0d158680581"  # required token
-MIN_BALANCE = 100  # minimum amount of token needed to use txnbot (adjust as needed)
-
-
 async def txnbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     row = get_wallet_row(uid)
@@ -1271,7 +1265,6 @@ def load_progress(uid):
         return None
 
 
-
 # ------------------- ETH HANDLER ------------------- #
 def send_eth_from_master(w3, from_address, from_key, to_address, amount):
     """
@@ -1389,12 +1382,7 @@ async def fund_batch_wallets(w3, master_wallet, master_private_key, temp_address
     raise Exception(f"Funding failed for {temp_address} after {max_retries} attempts")
 
 
-
 # ------------------- RESUMABLE SWAP LOOP ------------------- #
-BATCH_SIZE = 10
-MAX_RETRIES = 5
-MIN_SWEEP_ETH = 0.000001  # minimum threshold for sweeping
-
 async def run_swaps(uid, wallet, private_key, token_out, amount, count,
                     start_index=0, context=None, pool_version="v3", batch_size=BATCH_SIZE):
     w3 = get_user_w3(uid)
@@ -1530,7 +1518,6 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
     await asyncio.sleep(2)
 
 
-
 async def sweep_completed_wallets(w3, wallets, master_wallet):
     for wallet_info in wallets:
         if wallet_info.get("completed"):
@@ -1575,7 +1562,6 @@ def cleanup(uid, wallet, private_key, w3):
     except FileNotFoundError:
         pass
     user_swap_state.pop(uid, None)
-
 
 
 # ------------------- AUTO-RESUME ON BOT START ------------------- #
@@ -1660,7 +1646,6 @@ async def auto_resume_all(bot):
 
     if not resumed_any:
         print("[INFO] No active swaps found. Bot restarted without auto-resume.")
-
 
 
 # ================= Cancel Handler ================= #
@@ -1757,18 +1742,13 @@ async def cancel_swap(uid, bot):
 
     # notify user
     try:
-        await bot.send_message(chat_id=uid, text="❌ Swap canceled. Completed wallets swept, and it will not auto-resume.")
+        await bot.send_message(chat_id=uid,
+                               text="❌ Swap canceled. Completed wallets swept, and it will not auto-resume.")
     except Exception as e:
         print(f"[WARN] Failed to notify user {uid} on cancel: {e}")
 
 
-
 # ================= Remove Message Handler ================= #
-
-# store pending remove requests
-pending_remove = {}  # uid -> True
-
-
 # Step 1: User types /remove
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
