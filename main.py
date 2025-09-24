@@ -93,7 +93,6 @@ pending_remove = {}  # uid -> True
 user_rpc_map = {}  # sticky RPC assignment per user
 next_rpc_index = 0  # round-robin pointer
 
-
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 # --- Web3 Setup (Base Chain) ---
@@ -837,7 +836,8 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version=
 
             else:  # V3
                 # Wrap ETH -> WETH for V3
-                await loop.run_in_executor(None, wrap_eth_to_weth, private_key, amount, Web3(Web3.HTTPProvider(rpc_url)))
+                await loop.run_in_executor(None, wrap_eth_to_weth, private_key, amount,
+                                           Web3(Web3.HTTPProvider(rpc_url)))
 
                 # Perform the V3 swap
                 tx_hash = await asyncio.wait_for(
@@ -1477,7 +1477,6 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(2)
-
 
 
 async def sweep_completed_wallets(w3, wallets, master_wallet):
