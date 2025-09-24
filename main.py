@@ -90,6 +90,9 @@ MAX_RETRIES = 5
 user_swap_state = {}
 user_locks = {}
 pending_remove = {}  # uid -> True
+user_rpc_map = {}  # sticky RPC assignment per user
+next_rpc_index = 0  # round-robin pointer
+
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -689,11 +692,6 @@ async def swap_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             except ValueError:
                 await update.message.reply_text("⚠️ Invalid count. Enter a number.")
-
-
-# --- Sync Buy Logic --- #
-user_rpc_map = {}  # sticky RPC assignment per user
-next_rpc_index = 0  # round-robin pointer
 
 
 def assign_rpc(uid: int) -> str:
