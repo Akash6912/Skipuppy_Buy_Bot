@@ -83,7 +83,7 @@ WETH_ABI = [
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ERROR_LOG_FILE = "swap_errors.txt"
 FERNET_KEY = os.environ.get("MASTER_KEY")
-BATCH_SIZE = 10
+BATCH_SIZE = 5
 MAX_RETRIES = 5
 
 # ================= STORE VARIABLES ================= #
@@ -787,10 +787,6 @@ def do_buy_sync_v3(wallet, private_key, token_out, amount, rpc_url):
     """Perform Uniswap V3 ETH -> Token buy (Base chain)."""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
 
-    # Ensure ETH balance is enough / wrap if needed
-    wrap_eth_to_weth(private_key, amount, w3)
-    time.sleep(1)
-
     uniswap = Uniswap(
         wallet_address=wallet,
         private_key=private_key,
@@ -814,14 +810,14 @@ def do_buy_sync_v3(wallet, private_key, token_out, amount, rpc_url):
 # -------------------------------
 # Unified Async Wrapper
 # -------------------------------
-async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version="v3", max_retries=3):
+async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version="v3", max_retries=MAX_RETRIES):
     """
     Unified buy function: supports Uniswap V2 and V3.
-    - pool_version="v2" or "v3"
-    - Retries with round-robin RPCs on failure
+    - V2 swaps unchanged
+    - V3 optimized: wraps ETH->WETH, fast retries, executor-friendly
     """
     loop = asyncio.get_running_loop()
-    delay = 5
+    delay = 0.5 if pool_version.lower() == "v3" else 5
 
     base_rpc = assign_rpc(uid)
     base_index = RPC_ENDPOINTS.index(base_rpc)
@@ -829,7 +825,7 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version=
     for attempt in range(1, max_retries + 1):
         rpc_url = RPC_ENDPOINTS[(base_index + attempt - 1) % len(RPC_ENDPOINTS)]
         try:
-            if pool_version == "v2":
+            if pool_version.lower() == "v2":
                 tx_hash = await asyncio.wait_for(
                     loop.run_in_executor(
                         executor,
@@ -838,7 +834,12 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version=
                     ),
                     timeout=30
                 )
-            else:  # default = v3
+
+            else:  # V3
+                # Wrap ETH -> WETH for V3
+                await loop.run_in_executor(None, wrap_eth_to_weth, private_key, amount, Web3(Web3.HTTPProvider(rpc_url)))
+
+                # Perform the V3 swap
                 tx_hash = await asyncio.wait_for(
                     loop.run_in_executor(
                         executor,
@@ -850,7 +851,9 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version=
 
             if not tx_hash:
                 raise Exception("No tx hash returned")
-            return tx_hash  # ✅ raw tx hash immediately
+
+            print(f"[SUCCESS] Swap submitted for wallet {wallet}: {tx_hash}")
+            return tx_hash
 
         except asyncio.TimeoutError:
             if attempt == max_retries:
@@ -862,8 +865,8 @@ async def perform_buy(uid, wallet, private_key, token_out, amount, pool_version=
                 raise
             print(f"[WARN] Swap failed (attempt {attempt}, RPC={rpc_url}): {e}. Retrying in {delay}s...")
 
-        await asyncio.sleep(delay + random.uniform(0, 2))
-        delay = min(delay * 2, 60)
+        await asyncio.sleep(delay + random.uniform(0, 1))
+        delay = min(delay * 2, 2 if pool_version.lower() == "v3" else 60)
 
 
 async def with_user_lock(uid, coro):
@@ -1387,112 +1390,72 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
     msg = None
 
     # Load or initialize progress
-    progress = load_progress(uid) or {
-        "current_index": start_index - 1,
-        "temp_wallets": []
-    }
-
+    progress = load_progress(uid) or {"current_index": start_index - 1, "temp_wallets": []}
     success_count = progress["current_index"] + 1
     temp_wallets = progress["temp_wallets"]
+    active_wallets = temp_wallets.copy()
 
     print(f"[INFO] Starting run_swaps for {uid}: total={count}, start_index={success_count}")
 
     i = success_count
-    active_wallets = temp_wallets.copy()  # Track all wallets in memory
-
     try:
         while i < count:
-            # Batch determination
             batch_end = min(i + batch_size, count)
             current_batch_range = range(i, batch_end)
 
-            # Prepare wallets for swaps in batch
+            # Prepare batch wallets
             batch_wallets = []
             for idx in current_batch_range:
-                # Use existing temp wallet if not completed
                 if idx < len(active_wallets):
                     wallet_info = active_wallets[idx]
-                    if not wallet_info["completed"]:
-                        batch_wallets.append(wallet_info)
                 else:
-                    # Create new temp wallet
                     temp_pk, temp_addr = create_new_eth_wallet()
                     temp_addr = Web3.to_checksum_address(temp_addr)
                     wallet_info = {"private_key": temp_pk, "address": temp_addr, "completed": False}
                     active_wallets.append(wallet_info)
-                    batch_wallets.append(wallet_info)
+                batch_wallets.append(wallet_info)
 
-            # Fund batch wallets that are not yet funded
+            # Fund wallets for gas if needed
             for wallet_info in batch_wallets:
                 if not wallet_info.get("funded"):
-                    await fund_batch_wallets(w3, wallet, private_key, wallet_info["address"], 0.00002)
+                    await fund_batch_wallets(w3, wallet, private_key, wallet_info["address"], 0.00001)
                     wallet_info["funded"] = True
 
-            await asyncio.sleep(1)  # slight pause before swaps
+            # Launch swaps concurrently for V3
+            swap_tasks = [
+                perform_buy(uid, wallet_info["address"], wallet_info["private_key"],
+                            token_out, amount, pool_version=pool_version)
+                for wallet_info in batch_wallets if not wallet_info["completed"]
+            ]
 
-            # Sequential swaps
-            for idx, wallet_info in zip(current_batch_range, batch_wallets):
-                if wallet_info["completed"]:
-                    print(f"[INFO] Swap {idx + 1} already completed, skipping.")
-                    i += 1
-                    continue
+            # Process swaps as they complete (sequential Telegram notifications)
+            for coro in asyncio.as_completed(swap_tasks):
+                try:
+                    tx_hash = await coro
+                    # Identify wallet index
+                    wallet_info = next(w for w in batch_wallets if not w["completed"])
+                    wallet_info["completed"] = True
+                    success_count += 1
 
-                retry_delay = 1
-                attempt = 0
-                while True:
-                    try:
-                        if user_swap_state.get(uid, {}).get("cancel"):
-                            raise asyncio.CancelledError("Swap cancelled by user")
+                    save_progress(uid, wallet, private_key, token_out, amount, count,
+                                  i, pool_version=pool_version, temp_wallets=active_wallets)
 
-                        tx_hash = await with_user_lock(
-                            uid,
-                            perform_buy(uid, wallet_info["address"], wallet_info["private_key"],
-                                        token_out, amount, pool_version=pool_version)
+                    # Notify Telegram
+                    if msg:
+                        await safe_edit(uid, None, msg,
+                                        f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]")
+                    else:
+                        msg = await context.bot.send_message(
+                            chat_id=uid,
+                            text=f"✅ Swap {i + 1}/{count} [{pool_version.upper()}]"
                         )
-                        if not tx_hash:
-                            raise Exception("Swap failed: no tx hash returned")
 
-                        print(f"[INFO] Swap {idx + 1}/{count} successful: {tx_hash}")
-                        wallet_info["completed"] = True
-                        success_count += 1
+                    i += 1
 
-                        save_progress(uid, wallet, private_key, token_out, amount, count,
-                                      idx, pool_version, temp_wallets=active_wallets)
+                except Exception as e:
+                    print(f"[WARN] Swap failed: {e}. Will retry in next batch if needed.")
 
-                        # notify user
-                        if msg:
-                            await safe_edit(uid, None, msg,
-                                            f"✅ Swap {idx + 1}/{count} [{pool_version.upper()}]")
-                        else:
-                            msg = await context.bot.send_message(
-                                chat_id=uid,
-                                text=f"✅ Swap {idx + 1}/{count} [{pool_version.upper()}]"
-                            )
-
-                        break  # move to next swap
-
-                    except asyncio.CancelledError:
-                        print("[INFO] Cancel requested. Sweeping all completed wallets...")
-                        await sweep_all_wallets(w3, active_wallets, wallet)
-                        cleanup(uid, wallet, private_key, w3)
-                        return
-
-                    except Exception as e:
-                        attempt += 1
-                        err_msg = extract_error_message(e).lower()
-                        print(f"[WARN] Swap {idx + 1} failed (attempt {attempt}): {err_msg}")
-
-                        if attempt >= MAX_RETRIES:
-                            print(f"[ERROR] Swap {idx + 1} failed after {MAX_RETRIES} retries, stopping.")
-                            user_swap_state.pop(uid, None)
-                            return
-
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 10)
-
-                i += 1  # move to next swap
-
-            # Sweep completed wallets for batch
+            # Sweep completed wallets
             print(f"[INFO] Sweeping completed wallets for batch {i // batch_size}")
             await sweep_completed_wallets(w3, active_wallets, wallet)
 
@@ -1504,7 +1467,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
 
     # Final cleanup
     await asyncio.sleep(1)
-    print(f"[INFO] All swaps completed for {uid}. Sweeping remaining completed wallets...")
+    print(f"[INFO] All swaps completed for {uid}. Sweeping remaining wallets...")
     await sweep_all_wallets(w3, active_wallets, wallet)
     cleanup(uid, wallet, private_key, w3)
 
@@ -1514,6 +1477,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
 
     user_swap_state.pop(uid, None)
     await asyncio.sleep(2)
+
 
 
 async def sweep_completed_wallets(w3, wallets, master_wallet):
