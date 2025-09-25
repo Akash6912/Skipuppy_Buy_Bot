@@ -549,7 +549,7 @@ def wrap_eth_to_weth(private_key, amount_eth, w3: Web3) -> str:
         raise
 
 
-def unwrap_weth_to_eth(private_key: str, amount_wei: int, w3: Web3) -> str:
+def unwrap_weth_to_eth(private_key, amount, w3):
     """Unwrap WETH back into ETH safely (with pending nonce + gas bump)."""
     try:
         account = Account.from_key(private_key)
@@ -563,7 +563,7 @@ def unwrap_weth_to_eth(private_key: str, amount_wei: int, w3: Web3) -> str:
         # Gas bump (10%)
         gas_price = int(w3.eth.gas_price * 1.1)
 
-        tx = weth.functions.withdraw(amount_wei).build_transaction({
+        tx = weth.functions.withdraw(w3.to_wei(amount, "ether")).build_transaction({
             "from": address,
             "nonce": nonce,
             "gas": 100000,
