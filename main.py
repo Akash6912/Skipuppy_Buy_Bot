@@ -549,6 +549,37 @@ def wrap_eth_to_weth(private_key, amount_eth, w3: Web3) -> str:
         raise
 
 
+def unwrap_weth_to_eth(private_key: str, amount_wei: int, w3: Web3) -> str:
+    """Unwrap WETH back into ETH safely (with pending nonce + gas bump)."""
+    try:
+        account = Account.from_key(private_key)
+        address = account.address
+
+        weth = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
+
+        # Always fetch latest pending nonce
+        nonce = w3.eth.get_transaction_count(address, "pending")
+
+        # Gas bump (10%)
+        gas_price = int(w3.eth.gas_price * 1.1)
+
+        tx = weth.functions.withdraw(amount_wei).build_transaction({
+            "from": address,
+            "nonce": nonce,
+            "gas": 100000,
+            "gasPrice": gas_price,
+        })
+
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+        return tx_hash.hex()
+
+    except Exception as e:
+        print(f"[ERROR] WETH unwrap failed: {e}")
+        raise
+
+
 # --- Buy Handlers ---
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Enter token address:")
@@ -944,6 +975,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 slippage=int(slippage * 100),
                 pool_version="v3"
             )
+            unwrap_weth_to_eth(private_key, value_wei, w3)
 
         elif pool_version == "v2":
             print("[DEBUG] Using Uniswap V2 pool")
