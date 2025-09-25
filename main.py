@@ -975,7 +975,9 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 slippage=int(slippage * 100),
                 pool_version="v3"
             )
-            unwrap_weth_to_eth(private_key, value_wei, w3)
+            balance = get_eth_balance(wallet, w3)
+            if balance > 0:
+                unwrap_weth_to_eth(private_key, balance, w3)
 
         elif pool_version == "v2":
             print("[DEBUG] Using Uniswap V2 pool")
