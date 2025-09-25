@@ -996,7 +996,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
         return f"✅ Sell successful!\n🔗 https://basescan.org/tx/0x{tx_hash.hex()}"
 
     # --- Retry logic ---
-    delay = 5
+    delay = 2
     for attempt in range(1, max_retries + 1):
         try:
             result = await loop.run_in_executor(executor, sync_sell)
