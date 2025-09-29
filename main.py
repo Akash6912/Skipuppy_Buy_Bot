@@ -98,8 +98,8 @@ logger = logging.getLogger(__name__)
 # --- Web3 Setup (Base Chain) ---
 # List of available Base RPC endpoints
 RPC_ENDPOINTS = [
-    os.environ.get("BASE_RPC"),
-    os.environ.get("BASE_RPC1")
+    value for key, value in sorted(os.environ.items())
+    if key.startswith("BASE_RPC") and value
 ]
 
 # Keep web3 instances per endpoint
@@ -517,11 +517,15 @@ withdraw_handler = ConversationHandler(
 
 
 # ================= Wrap/Unwrap eth Handlers ================= #
-def wrap_eth_to_weth(private_key, amount_eth, w3: Web3) -> str:
+def wrap_eth_to_weth(private_key, amount_eth, w3: Web3) -> str | None:
     """Wrap ETH into WETH safely (with pending nonce + gas bump)."""
     try:
         account = Account.from_key(private_key)
         address = account.address
+
+        balance = get_eth_balance(address)
+        if balance >= amount_eth:
+            return None
 
         weth = w3.eth.contract(address=WETH_ADDRESS, abi=WETH_ABI)
 
@@ -878,7 +882,7 @@ async def with_user_lock(uid, coro):
 
 
 # ================= Sell Handler ================= #
-def get_eth_balance(address, w3):
+def get_eth_balance(address):
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json"
@@ -894,7 +898,7 @@ def get_eth_balance(address, w3):
         "params": [address, "erc20"]
     }
 
-    response = requests.post(os.environ.get("BASE_RPC"), headers=headers, data=json.dumps(payload))
+    response = requests.post(os.environ.get("BASE_RPC0"), headers=headers, data=json.dumps(payload))
 
     if response.status_code == 200:
         data = response.json()
@@ -975,7 +979,7 @@ async def perform_sell_v2_v3(wallet, private_key, token_in, amount, pool_version
                 slippage=int(slippage * 100),
                 pool_version="v3"
             )
-            balance = get_eth_balance(wallet, w3)
+            balance = get_eth_balance(wallet)
             if balance > 0:
                 unwrap_weth_to_eth(private_key, balance, w3)
 
