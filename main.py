@@ -33,6 +33,8 @@ load_dotenv(override=True)
 # ================= GLOBAL VARIABLES ================= #
 TOKEN_CONTRACT = "0x2fF5bE03a5456aB99836cc2caA4Ae0d158680581"  # required token
 MIN_BALANCE = 100  # minimum amount of token needed to use txnbot (adjust as needed)
+TOKEN_LIST = ["Skipuppy", "USDC"]
+
 WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000006")
 ROUTER_ADDRESS = Web3.to_checksum_address("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
 ROUTER_ABI = json.loads("""
@@ -68,7 +70,6 @@ ROUTER_ABI = json.loads("""
   }
 ]
 """)
-
 ERC20_ABI = [
     {"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
      "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
@@ -80,9 +81,11 @@ WETH_ABI = [
     {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [],
      "payable": False, "stateMutability": "nonpayable", "type": "function"},
 ]
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ERROR_LOG_FILE = "swap_errors.txt"
 FERNET_KEY = os.environ.get("MASTER_KEY")
+
 BATCH_SIZE = 5
 MAX_RETRIES = 5
 
@@ -276,7 +279,7 @@ async def fetch_metadata(session, contract_address):
         "method": "alchemy_getTokenMetadata",
         "params": [contract_address]
     }
-    async with session.post(os.environ.get("BASE_RPC"), json=meta_payload) as resp:
+    async with session.post(os.environ.get("BASE_RPC0"), json=meta_payload) as resp:
         try:
             data = await resp.json()
             return contract_address, data.get("result", {})
@@ -304,7 +307,7 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(os.environ.get("BASE_RPC"), json=payload) as resp:
+        async with session.post(os.environ.get("BASE_RPC0"), json=payload) as resp:
             try:
                 data = await resp.json()
             except Exception:
@@ -348,7 +351,8 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = meta.get("name", "")
 
             human = raw_balance / (10 ** decimals)
-            msg += f"• {symbol} ({name}): {human:.6f}\n"
+            if symbol in TOKEN_LIST:
+                msg += f"• {symbol} ({name}): {human:.6f}\n"
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
     await asyncio.sleep(2)
