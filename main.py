@@ -23,12 +23,6 @@ from telegram.ext import Application, ConversationHandler, CommandHandler, Messa
 from telegram.warnings import PTBUserWarning
 from web3 import Web3
 from swapcode import Uniswap
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import sqlite3
-import os
-import asyncio
-
 
 # Suppress only PTBUserWarning (not all warnings)
 warnings.filterwarnings("ignore", category=PTBUserWarning)
