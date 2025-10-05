@@ -22,8 +22,13 @@ from telegram.ext import Application, ConversationHandler, CommandHandler, Messa
     filters, ContextTypes
 from telegram.warnings import PTBUserWarning
 from web3 import Web3
-
 from swapcode import Uniswap
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import sqlite3
+import os
+import asyncio
+
 
 # Suppress only PTBUserWarning (not all warnings)
 warnings.filterwarnings("ignore", category=PTBUserWarning)
@@ -82,6 +87,7 @@ WETH_ABI = [
      "payable": False, "stateMutability": "nonpayable", "type": "function"},
 ]
 
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 ERROR_LOG_FILE = "swap_errors.txt"
 FERNET_KEY = os.environ.get("MASTER_KEY")
@@ -1859,6 +1865,39 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif data == "help":
         await help_handler(update, context)
 
+# ================= BroadCast Handlers ================= #
+def get_all_user_ids():
+    """Fetch all Telegram IDs from wallets table."""
+    conn = sqlite3.connect("wallets.db")
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM wallets")  # <-- use telegram_id
+    users = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return users
+
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized.")
+        return
+
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+
+    msg = " ".join(context.args)
+    users = get_all_user_ids()
+    sent, failed = 0, 0
+
+    for uid in users:
+        try:
+            await context.bot.send_message(uid, msg)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"✅ Done. Sent: {sent}, Failed: {failed}")
 
 # ================= SetCommands Handlers ================= #
 async def set_commands(app):
@@ -1897,6 +1936,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("deposit", deposit_handler))
+    app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(withdraw_handler)
 
     app.add_handler(CommandHandler("buy", buy_command))
