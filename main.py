@@ -1429,7 +1429,7 @@ async def run_swaps(uid, wallet, private_key, token_out, amount, count,
             # Fund wallets for gas if needed
             for wallet_info in batch_wallets:
                 if not wallet_info.get("funded"):
-                    await fund_batch_wallets(w3, wallet, private_key, wallet_info["address"], 0.00001)
+                    await fund_batch_wallets(w3, wallet, private_key, wallet_info["address"], 0.00002)
                     wallet_info["funded"] = True
 
             # Launch swaps concurrently for V3
@@ -1708,6 +1708,11 @@ async def cancel_swap(uid, bot):
 
     # notify user
     try:
+        try:
+            os.remove(f"progress_{uid}.json")
+            print("File removed")
+        except Exception as e:
+            print(f"[WARN] Failed to remove user file {uid} on cancel: {e}")
         await bot.send_message(chat_id=uid,
                                text="❌ Swap canceled. Completed wallets swept, and it will not auto-resume.")
     except Exception as e:
@@ -1859,6 +1864,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif data == "help":
         await help_handler(update, context)
 
+
 # ================= BroadCast Handlers ================= #
 def get_all_user_ids():
     """Fetch all Telegram IDs from wallets table."""
@@ -1892,6 +1898,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
 
     await update.message.reply_text(f"✅ Done. Sent: {sent}, Failed: {failed}")
+
 
 # ================= SetCommands Handlers ================= #
 async def set_commands(app):
